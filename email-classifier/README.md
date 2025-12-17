@@ -1,6 +1,6 @@
 # Email Classifier
 
-This sample shows how to deploying a **Production-Ready Email Classifier with TensorLake**.
+This sample shows how to deploying a **Production-Ready Email Ingestion API**.
 
 <a href="https://www.loom.com/share/cb5f140fbc6146568a1608e1f00169dc">
   <img src="loom-preview.png" alt="Watch the demo" width="50%">
