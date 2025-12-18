@@ -16,7 +16,7 @@ This sample shows how to deploy a **Production Ready Email Ingestion API**.
 - Signup at [Tensorlake Cloud](https://cloud.tensorlake.ai) to setup an api key
 - Get the [Tensorlake SDK](https://github.com/tensorlakeai/tensorlake) to deploy applications
 - Use `tensorlake login` with the SDK
-- Finally `tensorlake deploy email-classifier.py`
+- Finally `tensorlake deploy email-ingestion.py`
 
 **Download an email**<br />
 <img src="gmail-download-email.png" alt="Gmail download email" width="25%">
@@ -25,7 +25,7 @@ This sample shows how to deploy a **Production Ready Email Ingestion API**.
 
 ```bash
 EML_BASE64=$(base64 -i "<path_to_email>")
-curl https://api.tensorlake.ai/applications/classify_email \
+curl https://api.tensorlake.ai/applications/ingest_email \
  -H "Authorization: Bearer $TENSORLAKE_API_KEY" \
  -H "Content-Type: application/json" \
  -H "Accept: application/json" \
