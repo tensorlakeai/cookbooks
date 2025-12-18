@@ -41,6 +41,7 @@ jobs:
         working-directory: template-deployer
         env:
           TENSORLAKE_API_KEY: ${{ secrets.TENSORLAKE_DEV_API_KEY_TO_DEPLOY_TEMPLATE_DEPLOYER }}
+          TENSORLAKE_API_URL: https://api.tensorlake.dev
         run: tensorlake deploy main.py
 
   deploy-prod:
