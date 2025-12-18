@@ -1,0 +1,73 @@
+name: Deploy Template Deployer
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'template-deployer/**'
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        description: 'Environment to deploy to'
+        required: true
+        options:
+          - 'dev'
+          - 'prod'
+          - 'all'
+        default: 'all'
+
+jobs:
+  deploy-dev:
+    if: >-
+      github.event_name == 'push' ||
+      github.event.inputs.environment == 'dev' ||
+      github.event.inputs.environment == 'all'
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Tensorlake CLI
+        run: pip install tensorlake
+
+      - name: Deploy to Dev
+        working-directory: template-deployer
+        env:
+          TENSORLAKE_API_KEY: ${{ secrets.TENSORLAKE_API_KEY_TO_DEPLOY_TEMPLATE_DEPLOYER }}
+        run: tensorlake deploy main.py
+
+  deploy-prod:
+    needs: deploy-dev
+    # Run if: (dev succeeded OR dev was skipped) AND (push to main OR manual prod/all)
+    if: >-
+      always() &&
+      (needs.deploy-dev.result == 'success' || needs.deploy-dev.result == 'skipped') &&
+      (
+        github.event_name == 'push' ||
+        github.event.inputs.environment == 'prod' ||
+        github.event.inputs.environment == 'all'
+      )
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Install Tensorlake CLI
+        run: pip install tensorlake
+
+      - name: Deploy to Prod
+        working-directory: template-deployer
+        env:
+          TENSORLAKE_API_KEY: ${{ secrets.TENSORLAKE_API_KEY_TO_DEPLOY_TEMPLATE_DEPLOYER }}
+        run: tensorlake deploy main.py
