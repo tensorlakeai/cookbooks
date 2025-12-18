@@ -20,7 +20,7 @@ from tensorlake.applications import (
 )
 
 # Define custom image with dependencies
-email_classifier_image = (
+email_ingestion_image = (
     Image(name="email-classifier").run("pip install openai").run("pip install supabase")
 )
 
@@ -146,28 +146,33 @@ class InsuranceData(BaseModel):
 
 @application()
 @function(
-    image=email_classifier_image,
+    image=email_ingestion_image,
     description="Classifies email files (.eml) and summarizes attachments",
     memory=2.0,
     secrets=["TENSORLAKE_API_KEY", "OPENAI_API_KEY"],
 )
-def classify_email(eml_file: File) -> EmailClassification:
+def ingest_email(eml_file: File) -> EmailClassification:
     """
-    Classify an email file and extract/summarize attachments.
+    Ingest and classify an email (.eml) file and process its attachments.
 
-    This application parses .eml files and:
-    1. Classifies them into categories: spam, promotional, transactional, personal, work
-    2. Extracts all attachments
-    3. Uses Tensorlake DocumentAI to parse the attachments
-    4. Generates summaries for each attachment
-    5. Does structured data extraction for attachments: invoices, contracts, insurance
-    6. Uploads results to Supabase
+    This application performs end-to-end email ingestion by:
+    1. Decoding and parsing the raw .eml content
+    2. Extracting structured email metadata (sender, recipients, subject, body, attachments)
+    3. Classifying the email into one of: spam, promotional, transactional, personal, or work
+    4. Detecting urgency and sentiment signals from the email content
+    5. Extracting and parsing all attachments using Tensorlake DocumentAI
+    6. Generating AI-powered summaries and structured extractions
+    (e.g., invoices, contracts, insurance documents)
+    7. Persisting the enriched classification results to Supabase
 
     Args:
-        eml_file: A File object containing the .eml file content
+        eml_file: A `File` object containing the raw email (.eml) payload,
+                optionally base64-encoded within a JSON wrapper.
 
     Returns:
-        EmailClassification with category, confidence, reasoning, metadata, and attachment summaries
+        EmailClassification: A structured result containing the email category,
+        confidence score, classification rationale, extracted metadata,
+        sentiment and urgency indicators, and per-attachment summaries.
     """
     from openai import OpenAI
 
@@ -223,16 +228,6 @@ def extract_email_metadata(eml_content) -> EmailMetadata:
     print(
         f"extract_email_metadata - type: {type(eml_content)}, length: {len(eml_content) if eml_content else 0}"
     )
-
-    if isinstance(eml_content, str):
-        print("Converting string to bytes")
-        eml_content = eml_content.encode("utf-8")
-    elif isinstance(eml_content, bytearray):
-        print("Converting bytearray to bytes")
-        eml_content = bytes(eml_content)
-    elif eml_content is None:
-        print("ERROR: eml_content is None")
-        return EmailMetadata()  # Return empty metadata
 
     if len(eml_content) == 0:
         print("ERROR: eml_content is empty")
@@ -572,7 +567,7 @@ def detect_sentiment(metadata: EmailMetadata) -> str:
 
 
 @function(
-    image=email_classifier_image,
+    image=email_ingestion_image,
     secrets=["OPENAI_API_KEY"],
 )
 def summarize_document_content(
@@ -839,7 +834,7 @@ def extract_attachments(eml_content: bytes) -> list[tuple[str, str, bytes]]:
 
 
 @function(
-    image=email_classifier_image,
+    image=email_ingestion_image,
     secrets=["SUPABASE_URL", "SUPABASE_KEY"],
 )
 def upload_email_result_to_supabase(
@@ -1167,7 +1162,7 @@ if __name__ == "__main__":
             eml_content = f.read()
 
         eml_file = File(content=eml_content, content_type="message/rfc822")
-        request = run_local_application(classify_email, eml_file)
+        request = run_local_application(ingest_email, eml_file)
         result = request.output()
 
         print(f"\nEmail Classification Results:")
@@ -1214,7 +1209,7 @@ Unsubscribe: example.com/unsubscribe
 """
 
         eml_file = File(content=sample_eml, content_type="message/rfc822")
-        request = run_local_application(classify_email, eml_file)
+        request = run_local_application(ingest_email, eml_file)
         result = request.output()
 
         print(f"\nDemo Email Classification:")
