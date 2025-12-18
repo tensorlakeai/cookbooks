@@ -40,7 +40,7 @@ jobs:
       - name: Deploy to Dev
         working-directory: template-deployer
         env:
-          TENSORLAKE_API_KEY: ${{ secrets.TENSORLAKE_API_KEY_TO_DEPLOY_TEMPLATE_DEPLOYER }}
+          TENSORLAKE_API_KEY: ${{ secrets.TENSORLAKE_DEV_API_KEY_TO_DEPLOY_TEMPLATE_DEPLOYER }}
         run: tensorlake deploy main.py
 
   deploy-prod:
@@ -69,5 +69,5 @@ jobs:
       - name: Deploy to Prod
         working-directory: template-deployer
         env:
-          TENSORLAKE_API_KEY: ${{ secrets.TENSORLAKE_API_KEY_TO_DEPLOY_TEMPLATE_DEPLOYER }}
+          TENSORLAKE_API_KEY: ${{ secrets.TENSORLAKE_PROD_API_KEY_TO_DEPLOY_TEMPLATE_DEPLOYER }}
         run: tensorlake deploy main.py
