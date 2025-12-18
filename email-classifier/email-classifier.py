@@ -3,6 +3,7 @@
 
 import base64
 import json
+import os
 import tempfile
 from email import policy
 from email.parser import BytesParser
@@ -168,9 +169,6 @@ def classify_email(eml_file: File) -> EmailClassification:
     Returns:
         EmailClassification with category, confidence, reasoning, metadata, and attachment summaries
     """
-    import json
-    import os
-
     from openai import OpenAI
 
     tensorlake_api_key = os.environ.get("TENSORLAKE_API_KEY")
@@ -849,8 +847,22 @@ def upload_email_result_to_supabase(
     filename: str = "email.eml",
     processing_duration: float = 0.0,
 ) -> str:
-    """Upload a single email classification result to Supabase."""
-    import os
+    """
+    Uploads the results of a single email classification job to Supabase, including:
+      - Job record (summary of the processing run)
+      - Email record (main email metadata and classification)
+      - Attachment records (for each attachment, with structured data if available)
+
+    Args:
+        classification: The EmailClassification result object.
+        filename: The name of the processed email file.
+        processing_duration: Total processing time in seconds.
+
+    Returns:
+        The job ID of the created email processing job in Supabase.
+    Raises:
+        Exception: If any upload or database operation fails.
+    """
     import uuid
     from datetime import datetime, timezone
 
