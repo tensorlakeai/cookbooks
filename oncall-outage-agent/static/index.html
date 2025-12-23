@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tensorlake Outage Agent</title>
+
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;700&display=swap"
+        rel="stylesheet">
+
+    <!-- Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+
+    <!-- Styles -->
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+
+<body>
+    <div class="app-container">
+        <!-- Sidebar -->
+        <aside class="sidebar glass-panel">
+            <div class="brand">
+                <div class="logo-icon">
+                    <i data-lucide="zap"></i>
+                </div>
+                <div class="brand-text">
+                    <h1>Outage Agent</h1>
+                    <span class="powered-by">Powered by Tensorlake</span>
+                </div>
+            </div>
+
+            <nav class="nav-menu">
+                <a href="#" class="nav-item active">
+                    <i data-lucide="layout-dashboard"></i>
+                    <span>Dashboard</span>
+                </a>
+                <a href="#" class="nav-item">
+                    <i data-lucide="history"></i>
+                    <span>History</span>
+                </a>
+                <a href="#" class="nav-item">
+                    <i data-lucide="settings"></i>
+                    <span>Settings</span>
+                </a>
+            </nav>
+
+            <div class="status-card">
+                <div class="status-indicator pulse"></div>
+                <div class="status-text">
+                    <span class="label">System Status</span>
+                    <span class="value">Monitoring Active</span>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <header class="top-bar">
+                <div class="header-title">
+                    <h2>Live Operations</h2>
+                    <span class="subtitle">Real-time incident monitoring and response</span>
+                </div>
+
+                <div class="header-actions">
+                    <button id="simulate-btn" class="btn btn-primary">
+                        <i data-lucide="play-circle"></i>
+                        Simulate Outage
+                    </button>
+                    <div class="user-profile">
+                        <div class="avatar">DA</div>
+                    </div>
+                </div>
+            </header>
+
+            <!-- Stats Grid -->
+            <div class="stats-grid">
+                <div class="stat-card glass-panel">
+                    <div class="stat-icon info">
+                        <i data-lucide="activity"></i>
+                    </div>
+                    <div class="stat-content">
+                        <span class="stat-label">Services Monitored</span>
+                        <span class="stat-value">12</span>
+                    </div>
+                </div>
+
+                <div class="stat-card glass-panel">
+                    <div class="stat-icon success">
+                        <i data-lucide="check-circle-2"></i>
+                    </div>
+                    <div class="stat-content">
+                        <span class="stat-label">Incidents Resolved</span>
+                        <span class="stat-value" id="resolved-count">0</span>
+                    </div>
+                </div>
+
+                <div class="stat-card glass-panel">
+                    <div class="stat-icon warning">
+                        <i data-lucide="clock"></i>
+                    </div>
+                    <div class="stat-content">
+                        <span class="stat-label">Avg. Resolution</span>
+                        <span class="stat-value">45s</span>
+                    </div>
+                </div>
+
+                <div class="stat-card glass-panel">
+                    <div class="stat-icon purple">
+                        <i data-lucide="brain-circuit"></i>
+                    </div>
+                    <div class="stat-content">
+                        <span class="stat-label">AI Confidence</span>
+                        <span class="stat-value">High</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Active Incident Area (Dashboard View) -->
+            <div id="dashboard-view" class="view-section">
+                <div class="content-split">
+                    <!-- Recent Incidents List -->
+                    <div class="incidents-panel glass-panel">
+                        <div class="panel-header">
+                            <h3>Recent Incidents</h3>
+                            <span class="badge" id="incident-count">0</span>
+                        </div>
+                        <div class="incidents-list" id="incidents-list">
+                            <!-- Incidents will be populated here -->
+                            <div class="empty-state">
+                                <i data-lucide="shield-check"></i>
+                                <p>All systems operational</p>
+                                <span class="sub-text">Waiting for alerts...</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Incident Detail View -->
+                    <div class="detail-panel glass-panel">
+                        <div class="panel-header">
+                            <h3>Analysis & Response</h3>
+                            <div class="live-indicator hidden" id="processing-indicator">
+                                <span class="dot"></span> Processing
+                            </div>
+                        </div>
+
+                        <div class="detail-content" id="detail-content">
+                            <div class="empty-detail">
+                                <p>Select an incident to view details</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- History View -->
+            <div id="history-view" class="view-section hidden">
+                <div class="glass-panel full-height">
+                    <div class="panel-header">
+                        <h3>Incident History Log</h3>
+                        <div class="search-box">
+                            <i data-lucide="search"></i>
+                            <input type="text" placeholder="Search incidents..." id="history-search">
+                        </div>
+                    </div>
+                    <div class="table-container">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Time</th>
+                                    <th>Service</th>
+                                    <th>Severity</th>
+                                    <th>Summary</th>
+                                    <th>Root Cause</th>
+                                    <th>Escalated</th>
+                                </tr>
+                            </thead>
+                            <tbody id="history-table-body">
+                                <!-- Populated by JS -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Settings View -->
+            <div id="settings-view" class="view-section hidden">
+                <div class="settings-grid">
+                    <div class="glass-panel settings-card">
+                        <div class="panel-header">
+                            <h3><i data-lucide="key"></i> API Configuration</h3>
+                        </div>
+                        <div class="settings-body" id="api-status-list">
+                            <!-- Populated by JS -->
+                            <div class="loading-spinner">Loading status...</div>
+                        </div>
+                    </div>
+
+                    <div class="glass-panel settings-card">
+                        <div class="panel-header">
+                            <h3><i data-lucide="database"></i> Data Management</h3>
+                        </div>
+                        <div class="settings-body">
+                            <div class="setting-item">
+                                <div class="setting-info">
+                                    <h4>Clear Incident History</h4>
+                                    <p>Permanently remove all recorded incidents from the database.</p>
+                                </div>
+                                <button class="btn btn-danger" id="clear-history-btn">
+                                    <i data-lucide="trash-2"></i> Clear All Data
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="glass-panel settings-card">
+                        <div class="panel-header">
+                            <h3><i data-lucide="bell"></i> Notification Settings</h3>
+                        </div>
+                        <div class="settings-body">
+                            <div class="setting-item">
+                                <div class="setting-info">
+                                    <h4>Slack Notifications</h4>
+                                    <p>Send alerts to #oncall channel</p>
+                                </div>
+                                <label class="switch">
+                                    <input type="checkbox" checked disabled>
+                                    <span class="slider round"></span>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Simulation Modal -->
+    <div class="modal-overlay hidden" id="sim-modal">
+        <div class="modal glass-panel">
+            <div class="modal-header">
+                <h3>Simulate Outage</h3>
+                <button class="close-btn" id="close-modal"><i data-lucide="x"></i></button>
+            </div>
+            <div class="modal-body">
+                <p>Choose a scenario to trigger a simulated production incident:</p>
+
+                <div class="scenario-grid">
+                    <button class="scenario-card" data-scenario="kafka">
+                        <div class="icon red"><i data-lucide="server-crash"></i></div>
+                        <div class="info">
+                            <h4>Kafka Timeout</h4>
+                            <p>Critical payment failures</p>
+                        </div>
+                    </button>
+
+                    <button class="scenario-card" data-scenario="memory">
+                        <div class="icon orange"><i data-lucide="memory-stick"></i></div>
+                        <div class="info">
+                            <h4>Memory Leak</h4>
+                            <p>OOM crashes in user-service</p>
+                        </div>
+                    </button>
+
+                    <button class="scenario-card" data-scenario="db">
+                        <div class="icon yellow"><i data-lucide="database"></i></div>
+                        <div class="info">
+                            <h4>DB Connection</h4>
+                            <p>Connection pool exhausted</p>
+                        </div>
+                    </button>
+
+                    <button class="scenario-card" data-scenario="deploy">
+                        <div class="icon blue"><i data-lucide="git-merge"></i></div>
+                        <div class="info">
+                            <h4>Bad Deployment</h4>
+                            <p>Error spike after release</p>
+                        </div>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+    <script>
+        lucide.createIcons();
+    </script>
+</body>
+
+</html>
