@@ -1,6 +1,7 @@
 # Weather Agent
 
 A witty, conversational weather agent powered by Claude Opus 4.5. Ask about weather, plans, or why the sky does weird things.
+
 Once deployed, the agent will be available as an HTTP API that you can integrate into any application.
 
 ## Local Developement
