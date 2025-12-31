@@ -18,11 +18,10 @@ import base64
 import json
 import mimetypes
 import platform
-import re
-from urllib.parse import urljoin, urlparse
-from typing import Optional
+from urllib.parse import urlparse
 
-from tensorlake.applications import application, function, Retries, RequestContext, Image
+from pydantic import BaseModel, Field
+from tensorlake.applications import Image, Retries, application, function
 
 # Image with Chromium and pydoll for web scraping function
 scraper_image = (
@@ -50,12 +49,53 @@ chromium"""
 
 # File extensions that should be base64 encoded
 BINARY_EXTENSIONS = {
-    '.pdf', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.svg',
-    '.zip', '.tar', '.gz', '.rar', '.7z',
-    '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
-    '.mp3', '.mp4', '.wav', '.avi', '.mov', '.webm',
-    '.woff', '.woff2', '.ttf', '.eot', '.otf'
+    ".pdf",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".ico",
+    ".svg",
+    ".zip",
+    ".tar",
+    ".gz",
+    ".rar",
+    ".7z",
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".ppt",
+    ".pptx",
+    ".mp3",
+    ".mp4",
+    ".wav",
+    ".avi",
+    ".mov",
+    ".webm",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
+    ".otf",
 }
+
+
+class CrawlInput(BaseModel):
+    """Input model for the crawl function."""
+
+    url: str = Field(description="The starting URL to crawl")
+    max_depth: int = Field(
+        default=3,
+        ge=0,
+        description="Maximum depth to crawl (0 means only the starting URL)",
+    )
+    max_links: int = Field(
+        default=5,
+        ge=1,
+        description="Maximum number of links to crawl (None means unlimited)",
+    )
 
 
 def is_binary_url(url: str) -> bool:
@@ -69,7 +109,7 @@ def get_file_type(url: str) -> str:
     """Get the MIME type for a URL based on its extension."""
     parsed = urlparse(url)
     mime_type, _ = mimetypes.guess_type(parsed.path)
-    return mime_type or 'application/octet-stream'
+    return mime_type or "application/octet-stream"
 
 
 def is_same_domain(base_url: str, target_url: str) -> bool:
@@ -83,29 +123,29 @@ def normalize_url(url: str) -> str:
     """Normalize URL by removing fragments and trailing slashes."""
     parsed = urlparse(url)
     # Remove fragment and normalize path
-    normalized = parsed._replace(fragment='')
+    normalized = parsed._replace(fragment="")
     result = normalized.geturl()
     # Remove trailing slash for consistency (except for root)
-    if result.endswith('/') and parsed.path != '/':
+    if result.endswith("/") and parsed.path != "/":
         result = result[:-1]
     return result
 
 
 @application()
 @function()
-def crawl(input: dict) -> dict:
+def crawl(input: CrawlInput) -> dict:
     """
     Main crawler function that performs depth-first search on a website.
 
     Args:
-        input: dict with 'url', 'max_depth', and optional 'max_links' keys
+        input: CrawlInput model with 'url', 'max_depth', and optional 'max_links' fields
 
     Returns:
         Dictionary with crawled links and their content
     """
-    url = input["url"]
-    max_depth = input.get("max_depth", 3)
-    max_links = input.get("max_links")  # None means unlimited
+    url = str(input.url)
+    max_depth = input.max_depth
+    max_links = input.max_links
     ctx = None  # RequestContext not passed in local mode
 
     visited = set()
@@ -130,12 +170,14 @@ def crawl(input: dict) -> dict:
         visited.add(current_url)
 
         if ctx:
-            ctx.stream_output({
-                "status": "crawling",
-                "url": current_url,
-                "depth": depth,
-                "visited_count": len(visited)
-            })
+            ctx.stream_output(
+                {
+                    "status": "crawling",
+                    "url": current_url,
+                    "depth": depth,
+                    "visited_count": len(visited),
+                }
+            )
 
         # Offload content fetching to separate tensorlake function
         content_result = fetch_content(current_url)
@@ -148,40 +190,49 @@ def crawl(input: dict) -> dict:
                 for link in content_result["links"]:
                     normalized_link = normalize_url(link)
                     # Only crawl same-domain links that haven't been visited
-                    if is_same_domain(base_url, normalized_link) and normalized_link not in visited:
+                    if (
+                        is_same_domain(base_url, normalized_link)
+                        and normalized_link not in visited
+                    ):
                         # DFS: add to stack (will be processed depth-first)
                         stack.append((normalized_link, depth + 1))
 
             if ctx:
-                ctx.stream_output({
-                    "status": "fetched",
-                    "url": current_url,
-                    "content_type": content_result.get("content_type", "unknown"),
-                    "links_found": len(content_result.get("links", []))
-                })
+                ctx.stream_output(
+                    {
+                        "status": "fetched",
+                        "url": current_url,
+                        "content_type": content_result.get("content_type", "unknown"),
+                        "links_found": len(content_result.get("links", [])),
+                    }
+                )
         else:
             results[current_url] = content_result
             if ctx:
-                ctx.stream_output({
-                    "status": "failed",
-                    "url": current_url,
-                    "error": content_result.get("error", "Unknown error")
-                })
+                ctx.stream_output(
+                    {
+                        "status": "failed",
+                        "url": current_url,
+                        "error": content_result.get("error", "Unknown error"),
+                    }
+                )
 
     if ctx:
-        ctx.stream_output({
-            "status": "completed",
-            "total_urls": len(results),
-            "successful": sum(1 for r in results.values() if r.get("success")),
-            "failed": sum(1 for r in results.values() if not r.get("success"))
-        })
+        ctx.stream_output(
+            {
+                "status": "completed",
+                "total_urls": len(results),
+                "successful": sum(1 for r in results.values() if r.get("success")),
+                "failed": sum(1 for r in results.values() if not r.get("success")),
+            }
+        )
 
     return {
         "base_url": url,
         "max_depth": max_depth,
         "max_links": max_links,
         "total_crawled": len(results),
-        "pages": results
+        "pages": results,
     }
 
 
@@ -211,11 +262,7 @@ async def _fetch_content_async(url: str) -> dict:
         else:
             return await _fetch_page_content(url)
     except Exception as e:
-        return {
-            "url": url,
-            "success": False,
-            "error": str(e)
-        }
+        return {"url": url, "success": False, "error": str(e)}
 
 
 async def _fetch_binary_content(url: str) -> dict:
@@ -224,12 +271,11 @@ async def _fetch_binary_content(url: str) -> dict:
 
     try:
         req = urllib.request.Request(
-            url,
-            headers={'User-Agent': 'TensorlakeCrawler/1.0'}
+            url, headers={"User-Agent": "TensorlakeCrawler/1.0"}
         )
         with urllib.request.urlopen(req, timeout=30) as response:
             content = response.read()
-            content_type = response.headers.get('Content-Type', get_file_type(url))
+            content_type = response.headers.get("Content-Type", get_file_type(url))
 
             return {
                 "url": url,
@@ -239,24 +285,23 @@ async def _fetch_binary_content(url: str) -> dict:
                 "file_metadata": {
                     "mime_type": content_type,
                     "size_bytes": len(content),
-                    "extension": urlparse(url).path.split('.')[-1] if '.' in urlparse(url).path else None
+                    "extension": (
+                        urlparse(url).path.split(".")[-1]
+                        if "." in urlparse(url).path
+                        else None
+                    ),
                 },
-                "content_base64": base64.b64encode(content).decode('utf-8'),
-                "links": []  # Binary files don't have links
+                "content_base64": base64.b64encode(content).decode("utf-8"),
+                "links": [],  # Binary files don't have links
             }
     except Exception as e:
-        return {
-            "url": url,
-            "success": False,
-            "is_binary": True,
-            "error": str(e)
-        }
+        return {"url": url, "success": False, "is_binary": True, "error": str(e)}
 
 
 def extract_value(result: dict):
     """Extract the actual value from PyDoll's CDP response."""
     try:
-        return result['result']['result']['value']
+        return result["result"]["result"]["value"]
     except (KeyError, TypeError):
         return result
 
@@ -267,13 +312,13 @@ async def _fetch_page_content(url: str) -> dict:
     from pydoll.browser.options import ChromiumOptions
 
     options = ChromiumOptions()
-    if platform.system() == 'Linux':
-        options.binary_location = '/usr/bin/chromium'
-    options.add_argument('--headless=new')
-    options.add_argument('--disable-gpu')
-    options.add_argument('--no-sandbox')
-    options.add_argument('--disable-dev-shm-usage')
-    options.add_argument('--disable-notifications')
+    if platform.system() == "Linux":
+        options.binary_location = "/usr/bin/chromium"
+    options.add_argument("--headless=new")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-notifications")
 
     async with Chrome(options=options) as browser:
         tab = await browser.start()
@@ -285,23 +330,29 @@ async def _fetch_page_content(url: str) -> dict:
         await asyncio.sleep(2)
 
         # Get page content
-        html_result = await tab.execute_script('return document.documentElement.outerHTML')
+        html_result = await tab.execute_script(
+            "return document.documentElement.outerHTML"
+        )
         html = extract_value(html_result)
 
         # Extract text content
-        text_result = await tab.execute_script('''
+        text_result = await tab.execute_script(
+            """
             return document.body ? document.body.innerText : '';
-        ''')
+        """
+        )
         text_content = extract_value(text_result)
 
         # Extract all links (use JSON.stringify since arrays are returned as object refs)
-        links_result = await tab.execute_script('''
+        links_result = await tab.execute_script(
+            """
             const links = Array.from(document.querySelectorAll('a[href]'));
             const filtered = links.map(a => a.href).filter(href =>
                 href.startsWith('http://') || href.startsWith('https://')
             );
             return JSON.stringify(filtered);
-        ''')
+        """
+        )
         links_json = extract_value(links_result)
         links_data = json.loads(links_json) if links_json else []
 
@@ -310,10 +361,12 @@ async def _fetch_page_content(url: str) -> dict:
         title = extract_value(title_result)
 
         # Get meta description
-        meta_result = await tab.execute_script('''
+        meta_result = await tab.execute_script(
+            """
             const meta = document.querySelector('meta[name="description"]');
             return meta ? meta.getAttribute('content') : '';
-        ''')
+        """
+        )
         meta_description = extract_value(meta_result)
 
         # Deduplicate and normalize links
@@ -328,7 +381,7 @@ async def _fetch_page_content(url: str) -> dict:
             "meta_description": meta_description,
             "text_content": text_content,
             "html_length": len(html) if html else 0,
-            "links": unique_links
+            "links": unique_links,
         }
 
 
@@ -343,16 +396,18 @@ if __name__ == "__main__":
     print(f"Starting crawl of {test_url} with max depth {max_depth}")
     print("-" * 50)
 
-    request = run_local_application(crawl, {"url": test_url, "max_depth": max_depth, "max_links": 2})
+    request = run_local_application(
+        crawl, CrawlInput(url=test_url, max_depth=max_depth, max_links=2)
+    )
     result = request.output()
 
-    print(f"\nCrawl completed!")
+    print("\nCrawl completed!")
     print(f"Total pages crawled: {result['total_crawled']}")
-    print(f"\nPages:")
-    for url, data in result['pages'].items():
-        if data['success']:
-            content_type = data.get('content_type', 'unknown')
-            if data.get('is_binary'):
+    print("\nPages:")
+    for url, data in result["pages"].items():
+        if data["success"]:
+            content_type = data.get("content_type", "unknown")
+            if data.get("is_binary"):
                 print(f"  [BINARY] {url} - {content_type}")
             else:
                 print(f"  [HTML] {url} - {data.get('title', 'No title')}")
