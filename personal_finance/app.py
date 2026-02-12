@@ -255,6 +255,8 @@ def run_finance_agent(parsed_document: dict) -> FinanceResponse:
         AssistantMessage,
         TextBlock,
         ToolUseBlock,
+        ToolResultBlock,
+        ThinkingBlock,
         ResultMessage,
     )
 
@@ -387,13 +389,32 @@ def run_finance_agent(parsed_document: dict) -> FinanceResponse:
         async with ClaudeSDKClient(options=options) as client:
             await client.query("Analyze the statement, extract transactions, and save to database.")
 
+            progress_step = 20
             async for message in client.receive_response():
                 if isinstance(message, AssistantMessage):
                     for block in message.content:
-                        if isinstance(block, TextBlock):
-                            print(f"[Agent] {block.text[:200]}...", flush=True)
+                        if isinstance(block, ThinkingBlock):
+                            # Send model thinking as progress update
+                            thinking_preview = block.thinking[:300] + "..." if len(block.thinking) > 300 else block.thinking
+                            ctx.progress.update(progress_step, 100, f"Thinking: {thinking_preview}")
+                            print(f"[Agent Thinking] {thinking_preview}", flush=True)
+                        elif isinstance(block, TextBlock):
+                            # Send text response as progress update
+                            text_preview = block.text[:200] + "..." if len(block.text) > 200 else block.text
+                            ctx.progress.update(progress_step, 100, f"Agent: {text_preview}")
+                            print(f"[Agent] {text_preview}", flush=True)
                         elif isinstance(block, ToolUseBlock):
-                            print(f"[Agent] Calling: {block.name}", flush=True)
+                            # Send tool invocation as progress update
+                            tool_input_preview = json.dumps(block.input)[:100] if block.input else ""
+                            ctx.progress.update(progress_step, 100, f"Calling tool: {block.name} - {tool_input_preview}")
+                            print(f"[Agent] Calling: {block.name} with {tool_input_preview}", flush=True)
+                        elif isinstance(block, ToolResultBlock):
+                            # Send tool result as progress update
+                            result_preview = str(block.content)[:150] if block.content else "completed"
+                            status = "error" if block.is_error else "success"
+                            ctx.progress.update(progress_step, 100, f"Tool result ({status}): {result_preview}")
+                            print(f"[Agent] Tool result ({status}): {result_preview}", flush=True)
+                    progress_step = min(progress_step + 10, 90)
 
     asyncio.run(run_agent())
     ctx.progress.update(100, 100, f"Completed: {result_state['transactions_saved']} transactions")
@@ -550,6 +571,8 @@ def run_query_agent(question: str) -> QueryResponse:
         AssistantMessage,
         TextBlock,
         ToolUseBlock,
+        ToolResultBlock,
+        ThinkingBlock,
         ResultMessage,
     )
 
@@ -619,11 +642,33 @@ def run_query_agent(question: str) -> QueryResponse:
             await client.query(user_question)
 
             response_text = []
+            progress_step = 20
             async for message in client.receive_response():
                 if isinstance(message, AssistantMessage):
                     for block in message.content:
-                        if isinstance(block, TextBlock):
+                        if isinstance(block, ThinkingBlock):
+                            # Send model thinking as progress update
+                            thinking_preview = block.thinking[:300] + "..." if len(block.thinking) > 300 else block.thinking
+                            ctx.progress.update(progress_step, 100, f"Thinking: {thinking_preview}")
+                            print(f"[Agent Thinking] {thinking_preview}", flush=True)
+                        elif isinstance(block, TextBlock):
+                            # Send text response as progress update
+                            text_preview = block.text[:200] + "..." if len(block.text) > 200 else block.text
+                            ctx.progress.update(progress_step, 100, f"Agent: {text_preview}")
+                            print(f"[Agent] {text_preview}", flush=True)
                             response_text.append(block.text)
+                        elif isinstance(block, ToolUseBlock):
+                            # Send tool invocation as progress update
+                            tool_input_preview = json.dumps(block.input)[:100] if block.input else ""
+                            ctx.progress.update(progress_step, 100, f"Calling tool: {block.name} - {tool_input_preview}")
+                            print(f"[Agent] Calling: {block.name} with {tool_input_preview}", flush=True)
+                        elif isinstance(block, ToolResultBlock):
+                            # Send tool result as progress update
+                            result_preview = str(block.content)[:150] if block.content else "completed"
+                            status = "error" if block.is_error else "success"
+                            ctx.progress.update(progress_step, 100, f"Tool result ({status}): {result_preview}")
+                            print(f"[Agent] Tool result ({status}): {result_preview}", flush=True)
+                    progress_step = min(progress_step + 10, 90)
 
             result_state["answer"] = "\n".join(response_text)
 

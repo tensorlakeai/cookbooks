@@ -21,7 +21,7 @@ import platform
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field
-from tensorlake.applications import Image, Retries, application, function
+from tensorlake.applications import Image, RequestContext, Retries, application, function
 
 # Image with Chromium and pydoll for web scraping function
 scraper_image = (
@@ -146,11 +146,12 @@ def crawl(input: CrawlInput) -> dict:
     url = str(input.url)
     max_depth = input.max_depth
     max_links = input.max_links
-    ctx = None  # RequestContext not passed in local mode
+    ctx = RequestContext.get()
 
     visited = set()
     results = {}
     base_url = url
+    link_count = 0
 
     # Stack for DFS: (url, depth)
     stack = [(normalize_url(url), 0)]
@@ -168,16 +169,15 @@ def crawl(input: CrawlInput) -> dict:
             continue
 
         visited.add(current_url)
+        link_count += 1
 
-        if ctx:
-            ctx.stream_output(
-                {
-                    "status": "crawling",
-                    "url": current_url,
-                    "depth": depth,
-                    "visited_count": len(visited),
-                }
-            )
+        # Send progress update for opening this link
+        ctx.progress.update(
+            link_count,
+            max_links,
+            f"Opening link {link_count}/{max_links}: {current_url}",
+            {"url": current_url, "depth": str(depth), "status": "crawling"},
+        )
 
         # Offload content fetching to separate tensorlake function
         content_result = fetch_content(current_url)
@@ -197,35 +197,41 @@ def crawl(input: CrawlInput) -> dict:
                         # DFS: add to stack (will be processed depth-first)
                         stack.append((normalized_link, depth + 1))
 
-            if ctx:
-                ctx.stream_output(
-                    {
-                        "status": "fetched",
-                        "url": current_url,
-                        "content_type": content_result.get("content_type", "unknown"),
-                        "links_found": len(content_result.get("links", [])),
-                    }
-                )
+            ctx.progress.update(
+                link_count,
+                max_links,
+                f"Fetched {current_url}",
+                {
+                    "url": current_url,
+                    "status": "fetched",
+                    "content_type": content_result.get("content_type", "unknown"),
+                    "links_found": str(len(content_result.get("links", []))),
+                },
+            )
         else:
             results[current_url] = content_result
-            if ctx:
-                ctx.stream_output(
-                    {
-                        "status": "failed",
-                        "url": current_url,
-                        "error": content_result.get("error", "Unknown error"),
-                    }
-                )
+            ctx.progress.update(
+                link_count,
+                max_links,
+                f"Failed to fetch {current_url}",
+                {
+                    "url": current_url,
+                    "status": "failed",
+                    "error": content_result.get("error", "Unknown error"),
+                },
+            )
 
-    if ctx:
-        ctx.stream_output(
-            {
-                "status": "completed",
-                "total_urls": len(results),
-                "successful": sum(1 for r in results.values() if r.get("success")),
-                "failed": sum(1 for r in results.values() if not r.get("success")),
-            }
-        )
+    ctx.progress.update(
+        link_count,
+        max_links,
+        "Crawl completed",
+        {
+            "status": "completed",
+            "total_urls": str(len(results)),
+            "successful": str(sum(1 for r in results.values() if r.get("success"))),
+            "failed": str(sum(1 for r in results.values() if not r.get("success"))),
+        },
+    )
 
     return {
         "base_url": url,
