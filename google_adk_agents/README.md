@@ -2,6 +2,8 @@
 
 Run [Google Agent Development Kit (ADK)](https://google.github.io/adk-docs/agents/) agents as serverless applications on TensorLake. Each example demonstrates a different ADK agent type, rewritten so that every LLM agent and tool runs as its own TensorLake function in a separate container.
 
+> **Note:** TensorLake functions are currently synchronous only (async support is landing in a few weeks). Since Google ADK's `InMemoryRunner` exposes an async API, each example wraps the async calls in `asyncio.run()` inside a sync TensorLake function. Once async functions are supported, the `asyncio.run()` wrapper can be removed and functions can be declared `async def` directly.
+
 ## Examples
 
 | File | ADK Agent Type | What it demonstrates |
@@ -26,17 +28,23 @@ Run [Google Agent Development Kit (ADK)](https://google.github.io/adk-docs/agent
 
 - Python 3.11+
 - A [Google AI API key](https://aistudio.google.com/apikey) (for Gemini models)
-- A [TensorLake account](https://cloud.tensorlake.ai)
+- A [TensorLake account](https://cloud.tensorlake.ai) and API key
 
-## Local Development
+## Setup
 
 ```bash
-# Create virtual environment
+# Create and activate virtual environment
 python3 -m venv venv
 source venv/bin/activate
 
 # Install dependencies
 pip install tensorlake google-adk
+
+# Set your Google AI API key (required for local testing and as a TensorLake secret)
+export GOOGLE_API_KEY=your_google_api_key
+
+# Set your TensorLake API key (required for deploy and remote invocation)
+export TENSORLAKE_API_KEY=your_tensorlake_api_key
 ```
 
 ## Test Locally
@@ -44,31 +52,15 @@ pip install tensorlake google-adk
 Each example can be run directly with TensorLake's local runner:
 
 ```bash
-# Basic agent
 python basic_agent.py
-
-# LLM agent with tools
 python llm_agent_example.py
-
-# Sequential pipeline
 python sequential_agent_example.py
-
-# Parallel research agents
 python parallel_agent_example.py
-```
-
-For local execution, set your Google AI API key as an environment variable:
-
-```bash
-export GOOGLE_API_KEY=your_api_key_here
 ```
 
 ## Deploy to TensorLake
 
 ```bash
-# Set your TensorLake API key
-export TENSORLAKE_API_KEY=your_tensorlake_api_key
-
 # Set the Google API key as a secret in your TensorLake project
 tensorlake secrets set GOOGLE_API_KEY=your_google_api_key
 
@@ -81,35 +73,43 @@ tensorlake deploy parallel_agent_example.py
 
 ## Test Deployed Applications
 
-Once deployed, call applications via the TensorLake API:
+Once deployed, call applications via the TensorLake API. Each application takes a single string argument, sent as a raw JSON string:
 
 ```bash
 # Basic agent
-curl -X POST https://api.tensorlake.ai/applications/google_adk_basic_agent \
-  -H "Content-Type: application/json" \
+curl https://api.tensorlake.ai/applications/google_adk_basic_agent \
   -H "Authorization: Bearer $TENSORLAKE_API_KEY" \
-  -d '{"query": "What is the weather in New York?", "user_id": "user1", "session_id": "sess1"}'
+  --json '"What is the weather in New York?"'
 
 # LLM agent
-curl -X POST https://api.tensorlake.ai/applications/capital_agent \
-  -H "Content-Type: application/json" \
+curl https://api.tensorlake.ai/applications/capital_agent \
   -H "Authorization: Bearer $TENSORLAKE_API_KEY" \
-  -d '{"query": "What is the capital of France and its population?"}'
+  --json '"What is the capital of France and its population?"'
 
 # Sequential pipeline
-curl -X POST https://api.tensorlake.ai/applications/code_pipeline \
-  -H "Content-Type: application/json" \
+curl https://api.tensorlake.ai/applications/code_pipeline \
   -H "Authorization: Bearer $TENSORLAKE_API_KEY" \
-  -d '{"specification": "Write a Python function that returns the top K most frequent elements from a list."}'
+  --json '"Write a Python function that returns the top K most frequent elements from a list."'
 
 # Parallel research
-curl -X POST https://api.tensorlake.ai/applications/parallel_research \
-  -H "Content-Type: application/json" \
+curl https://api.tensorlake.ai/applications/parallel_research \
   -H "Authorization: Bearer $TENSORLAKE_API_KEY" \
-  -d '{"topic": "Latest sustainability technology trends"}'
+  --json '"Latest sustainability technology trends"'
 ```
 
-Or from Python:
+The API is async -- the response contains a `request_id`. Poll for the result:
+
+```bash
+# Check status
+curl https://api.tensorlake.ai/applications/capital_agent/requests/$REQUEST_ID \
+  -H "Authorization: Bearer $TENSORLAKE_API_KEY"
+
+# Get output (once status is "success")
+curl https://api.tensorlake.ai/applications/capital_agent/requests/$REQUEST_ID/output \
+  -H "Authorization: Bearer $TENSORLAKE_API_KEY"
+```
+
+Or from Python (blocks until complete):
 
 ```python
 from tensorlake.applications import run_remote_application
