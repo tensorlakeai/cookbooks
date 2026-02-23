@@ -71,7 +71,7 @@ class FindingLifecycle(BaseModel):
 class SecuritySweepRequest(BaseModel):
     repo_path: str = "."
     repo_url: str = ""
-    repo_branch: str = "main"
+    repo_branch: str = ""  # Empty = use the remote's default branch.
     include_globs: list[str] = Field(default_factory=lambda: ["**/*.py"])
     exclude_globs: list[str] = Field(
         default_factory=lambda: [

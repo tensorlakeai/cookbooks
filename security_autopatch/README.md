@@ -78,7 +78,7 @@ All env var options:
 | Variable | Default | Description |
 |---|---|---|
 | `SCAN_REPO_URL` | _(empty)_ | Git URL to clone. If set, `SCAN_REPO_PATH` is ignored. |
-| `SCAN_REPO_BRANCH` | `main` | Branch or tag to clone. |
+| `SCAN_REPO_BRANCH` | _(empty)_ | Branch or tag to clone. If unset, the remote's default branch is used. |
 | `SCAN_REPO_PATH` | `.` | Local path to scan (used when `SCAN_REPO_URL` is not set). |
 | `SCAN_REPORT_PATH` | _(empty)_ | If set, the markdown report is also written to this file. |
 
@@ -100,7 +100,7 @@ curl -X POST https://api.tensorlake.ai/applications/security_autopatch \
   -H "Accept: application/json" \
   -d '{
     "repo_url": "https://github.com/org/repo",
-    "repo_branch": "main",
+    "repo_branch": "",
     "include_globs": ["**/*.py"],
     "exclude_globs": ["**/.venv/**", "**/venv/**", "**/node_modules/**"],
     "vulnerability_classes": ["idor", "sql_injection", "ssrf", "command_injection"],

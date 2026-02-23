@@ -271,11 +271,11 @@ def _build_summary_markdown(
 def build_code_corpus(request: SecuritySweepRequest) -> list[FileSnippet]:
     if request.repo_url:
         tmp = tempfile.mkdtemp()
-        subprocess.run(
-            ["git", "clone", "--depth", "1", "--branch", request.repo_branch, request.repo_url, tmp],
-            check=True,
-            capture_output=True,
-        )
+        clone_cmd = ["git", "clone", "--depth", "1"]
+        if request.repo_branch:
+            clone_cmd += ["--branch", request.repo_branch]
+        clone_cmd += [request.repo_url, tmp]
+        subprocess.run(clone_cmd, check=True, capture_output=True)
         repo = Path(tmp)
     else:
         repo = _resolve_repo_path(request.repo_path)
@@ -734,7 +734,7 @@ def security_autopatch(request: SecuritySweepRequest) -> SecuritySweepReport:
 if __name__ == "__main__":
     sample_request = SecuritySweepRequest(
         repo_url=os.getenv("SCAN_REPO_URL", ""),
-        repo_branch=os.getenv("SCAN_REPO_BRANCH", "main"),
+        repo_branch=os.getenv("SCAN_REPO_BRANCH", ""),
         repo_path=os.getenv("SCAN_REPO_PATH", "."),
         include_globs=["**/*.py"],
         exclude_globs=["**/.venv/**", "**/venv/**", "**/node_modules/**"],
