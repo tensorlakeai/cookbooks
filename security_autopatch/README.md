@@ -49,11 +49,38 @@ export OPENAI_API_KEY="sk-..."
 
 ## Run Locally
 
+Scan the current directory:
+
 ```bash
 python app.py
 ```
 
-The local run scans `repo_path="."` by default and prints a markdown security report.
+Scan a specific local path:
+
+```bash
+SCAN_REPO_PATH=/path/to/your/repo python app.py
+```
+
+Scan a remote repository (cloned at runtime):
+
+```bash
+SCAN_REPO_URL=https://github.com/org/repo SCAN_REPO_BRANCH=main python app.py
+```
+
+For private repos, embed a token in the URL:
+
+```bash
+SCAN_REPO_URL=https://token:ghp_xxx@github.com/org/repo python app.py
+```
+
+All env var options:
+
+| Variable | Default | Description |
+|---|---|---|
+| `SCAN_REPO_URL` | _(empty)_ | Git URL to clone. If set, `SCAN_REPO_PATH` is ignored. |
+| `SCAN_REPO_BRANCH` | `main` | Branch or tag to clone. |
+| `SCAN_REPO_PATH` | `.` | Local path to scan (used when `SCAN_REPO_URL` is not set). |
+| `SCAN_REPORT_PATH` | _(empty)_ | If set, the markdown report is also written to this file. |
 
 ## Deploy
 
@@ -64,12 +91,16 @@ tensorlake deploy app.py
 
 ## Invoke (Remote)
 
+Scan a public repository:
+
 ```bash
 curl -X POST https://api.tensorlake.ai/applications/security_autopatch \
   -H "Authorization: Bearer $TENSORLAKE_API_KEY" \
   -H "Content-Type: application/json" \
+  -H "Accept: application/json" \
   -d '{
-    "repo_path": "/workspace/repo",
+    "repo_url": "https://github.com/org/repo",
+    "repo_branch": "main",
     "include_globs": ["**/*.py"],
     "exclude_globs": ["**/.venv/**", "**/venv/**", "**/node_modules/**"],
     "vulnerability_classes": ["idor", "sql_injection", "ssrf", "command_injection"],
@@ -79,6 +110,20 @@ curl -X POST https://api.tensorlake.ai/applications/security_autopatch \
     "test_command": "pytest -q",
     "run_validation": true,
     "generate_fixes": true
+  }'
+```
+
+For private repos, embed a token in `repo_url`:
+
+```bash
+curl -X POST https://api.tensorlake.ai/applications/security_autopatch \
+  -H "Authorization: Bearer $TENSORLAKE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json" \
+  -d '{
+    "repo_url": "https://token:ghp_xxx@github.com/org/repo",
+    "repo_branch": "main",
+    ...
   }'
 ```
 

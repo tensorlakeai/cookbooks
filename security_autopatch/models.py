@@ -70,6 +70,8 @@ class FindingLifecycle(BaseModel):
 
 class SecuritySweepRequest(BaseModel):
     repo_path: str = "."
+    repo_url: str = ""
+    repo_branch: str = "main"
     include_globs: list[str] = Field(default_factory=lambda: ["**/*.py"])
     exclude_globs: list[str] = Field(
         default_factory=lambda: [

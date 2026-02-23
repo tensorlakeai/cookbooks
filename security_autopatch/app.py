@@ -1,6 +1,8 @@
 import fnmatch
 import json
 import os
+import subprocess
+import tempfile
 from pathlib import Path
 
 from openai import OpenAI
@@ -37,7 +39,11 @@ from prompts import (
 )
 
 
-security_image = Image(name="security-autopatch").run("pip install openai pydantic")
+security_image = (
+    Image(name="security-autopatch")
+    .run("apt-get update && apt-get install -y git")
+    .run("pip install openai pydantic")
+)
 
 
 def _resolve_repo_path(repo_path: str) -> Path:
@@ -263,7 +269,16 @@ def _build_summary_markdown(
 
 @function(image=security_image, timeout=300)
 def build_code_corpus(request: SecuritySweepRequest) -> list[FileSnippet]:
-    repo = _resolve_repo_path(request.repo_path)
+    if request.repo_url:
+        tmp = tempfile.mkdtemp()
+        subprocess.run(
+            ["git", "clone", "--depth", "1", "--branch", request.repo_branch, request.repo_url, tmp],
+            check=True,
+            capture_output=True,
+        )
+        repo = Path(tmp)
+    else:
+        repo = _resolve_repo_path(request.repo_path)
     extensions = {
         extension.lower() if extension.startswith(".") else f".{extension.lower()}"
         for extension in request.file_extensions
@@ -718,7 +733,9 @@ def security_autopatch(request: SecuritySweepRequest) -> SecuritySweepReport:
 
 if __name__ == "__main__":
     sample_request = SecuritySweepRequest(
-        repo_path=".",
+        repo_url=os.getenv("SCAN_REPO_URL", ""),
+        repo_branch=os.getenv("SCAN_REPO_BRANCH", "main"),
+        repo_path=os.getenv("SCAN_REPO_PATH", "."),
         include_globs=["**/*.py"],
         exclude_globs=["**/.venv/**", "**/venv/**", "**/node_modules/**"],
         vulnerability_classes=["idor", "sql_injection", "ssrf", "command_injection"],
