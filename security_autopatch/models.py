@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import uuid
 from typing import Literal
 
@@ -81,6 +79,7 @@ class SecuritySweepRequest(BaseModel):
             "**/dist/**",
             "**/build/**",
             "**/migrations/**",
+            "**/__pycache__/**",
         ]
     )
     file_extensions: list[str] = Field(default_factory=lambda: [".py"])

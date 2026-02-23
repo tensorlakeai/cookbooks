@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import fnmatch
 import json
 import os
@@ -49,13 +47,28 @@ def _resolve_repo_path(repo_path: str) -> Path:
     return resolved
 
 
+def _match_glob(path: str, pattern: str) -> bool:
+    """Match path against a glob pattern.
+
+    Both fnmatch and Path.match require at least one directory separator for
+    patterns like ``**/*.py``, so root-level files are never matched by those
+    helpers alone.  When the pattern starts with ``**/`` we therefore also
+    test the path against the tail of the pattern (the part after ``**/``).
+    """
+    if fnmatch.fnmatch(path, pattern):
+        return True
+    if pattern.startswith("**/"):
+        return fnmatch.fnmatch(path, pattern[3:])
+    return False
+
+
 def _matches_globs(path: str, include_globs: list[str], exclude_globs: list[str]) -> bool:
     include_ok = True if not include_globs else any(
-        fnmatch.fnmatch(path, pattern) for pattern in include_globs
+        _match_glob(path, pattern) for pattern in include_globs
     )
     if not include_ok:
         return False
-    return not any(fnmatch.fnmatch(path, pattern) for pattern in exclude_globs)
+    return not any(_match_glob(path, pattern) for pattern in exclude_globs)
 
 
 def _parse_json_object(raw: str) -> dict:
