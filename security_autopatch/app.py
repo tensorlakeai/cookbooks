@@ -200,7 +200,8 @@ def _build_summary_markdown(
     lines = [
         "# Security Autopatch Sweep",
         "",
-        f"- Repository: `{request.repo_path}`",
+        f"- Repository: `{request.repo_url or request.repo_path}`",
+        f"- Branch: `{request.repo_branch or 'default'}`",
         f"- Detectors run: `{len(detector_results)}`",
         f"- Findings detected: `{len(lifecycles)}`",
         f"- Findings approved by manager: `{approved}`",
@@ -523,7 +524,8 @@ def security_autopatch(request: SecuritySweepRequest) -> SecuritySweepReport:
 
     if not snippets:
         empty_report = SecuritySweepReport(
-            repo_path=request.repo_path,
+            repo_path=request.repo_url or request.repo_path,
+            repo_branch=request.repo_branch,
             files_scanned=0,
             detectors_run=len(request.vulnerability_classes),
             findings_detected=0,
@@ -718,7 +720,8 @@ def security_autopatch(request: SecuritySweepRequest) -> SecuritySweepReport:
     )
 
     return SecuritySweepReport(
-        repo_path=request.repo_path,
+        repo_path=request.repo_url or request.repo_path,
+        repo_branch=request.repo_branch,
         files_scanned=len(snippets),
         detectors_run=len(request.vulnerability_classes),
         findings_detected=len(candidates),

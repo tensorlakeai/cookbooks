@@ -99,6 +99,7 @@ class SecuritySweepRequest(BaseModel):
 
 class SecuritySweepReport(BaseModel):
     repo_path: str
+    repo_branch: str = ""
     files_scanned: int
     detectors_run: int
     findings_detected: int
