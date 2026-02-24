@@ -142,8 +142,13 @@ curl -X POST https://api.tensorlake.ai/applications/security_autopatch \
 - This example generates test drafts and patch proposals; it does not auto-apply diffs or auto-open PRs.
 - Keep human review in the loop before merging security fixes.
 
-## Example summary report
-# Security Autopatch Sweep
+## Example Report
+
+---
+
+_Sample output from scanning [crewAIInc/crewAI](https://github.com/crewAIInc/crewAI)_
+
+### Security Autopatch Sweep
 
 - Repository: `https://github.com/crewAIInc/crewAI`
 - Branch: `main`
@@ -153,53 +158,43 @@ curl -X POST https://api.tensorlake.ai/applications/security_autopatch \
 - Findings confirmed by validator: `1`
 - Fix proposals generated: `1`
 
-## Detector Notes
-- `idor`: 0 findings. The code snippets show organization switching and tool API calls that accept organization IDs from client input. The organization switching code in crewai/src/crewai/cli/organization/main.py fetches the list of organizations the user belongs to and only allows switching to an org in that list, preventing direct access to arbitrary org IDs. The GenerateCrewaiAutomationTool adds an optional organization_id header to API calls but does not itself validate ownership. The PlusAPI class includes the org UUID from settings in headers, but does not show direct ID validation. No direct IDOR vulnerability is found because all org IDs used in API calls are either validated against the user's org list or come from authenticated settings. No cross-tenant or cross-user data access via unchecked IDs is evident.
-- `sql_injection`: 1 findings. Detected SQL injection risk in NL2SQLTool where user input is directly interpolated into SQL query strings without parameter binding.
-- `ssrf`: 0 findings. No realistic SSRF vulnerabilities found in the provided test code snippets. All HTTP requests in tests use fixed or mocked URLs, environment variables, or internal API endpoints without direct attacker-controlled URL input. No unvalidated URL fetches from user input or external sources are present.
-- `command_injection`: 0 findings. No realistic command injection vulnerabilities found. All subprocess.run calls use argument lists without shell=True and do not incorporate unescaped user input directly into shell commands.
+#### Detector Notes
 
-## Finding Details
+- `idor`: 0 findings. No direct IDOR vulnerability found — organization IDs are validated against the user's org list before use.
+- `sql_injection`: 1 findings. Detected SQL injection risk in NL2SQLTool where user input is directly interpolated into SQL query strings without parameter binding.
+- `ssrf`: 0 findings. All HTTP requests use fixed or mocked URLs without direct attacker-controlled URL input.
+- `command_injection`: 0 findings. All subprocess.run calls use argument lists without shell=True.
+
+#### Finding Details
 
 ---
 
-### nl2sql_tool_001 — [HIGH] `sql_injection`
+##### nl2sql_tool_001 — [HIGH] `sql_injection`
 
 **Location:** `lib/crewai-tools/src/crewai_tools/tools/nl2sql/nl2sql_tool.py:56` &nbsp;|&nbsp; **Endpoint:** `_run(sql_query: str)` &nbsp;|&nbsp; **Confidence:** `90%`
 
 **Summary:** Direct string interpolation of user input into SQL query without parameter binding in execute_sql method.
 
 **Evidence:**
-```
-def _fetch_all_available_columns(self, table_name: str):
-    return self.execute_sql(
-        f"SELECT column_name, data_type FROM information_schema.columns WHERE table_name = '{table_name}';"  # noqa: S608
-    )
-
-...
-
+```python
 def _run(self, sql_query: str):
     try:
         data = self.execute_sql(sql_query)
-    except Exception as exc:
-        ...
-
-...
+    ...
 
 def execute_sql(self, sql_query: str) -> list | str:
     ...
     result = session.execute(text(sql_query))
-    ...
 ```
 
-**Exploit scenario:** An attacker can craft malicious SQL queries as input to the _run method, which are then executed directly by execute_sql without parameterization, allowing arbitrary SQL execution, data leakage, or data manipulation.
+**Exploit scenario:** An attacker can craft malicious SQL queries as input to `_run`, which are executed directly without parameterization, allowing arbitrary SQL execution, data leakage, or data manipulation.
 
-**Recommended fix:** Use parameterized queries with bound parameters instead of direct string interpolation. For example, use SQLAlchemy text() with parameters or ORM query APIs that safely bind user inputs.
+**Recommended fix:** Use parameterized queries with bound parameters instead of direct string interpolation.
 
-**Manager review:** `approved` — The evidence shows that user input is directly passed as a raw SQL string to execute_sql without any parameterization or sanitization, allowing arbitrary SQL execution. The call stack does not mitigate this risk.
+**Manager review:** `approved` — User input is directly passed as a raw SQL string to execute_sql without sanitization.
 
-**Validation:** `confirmed` — The _run method executes raw SQL queries from user input without parameterization, allowing SQL injection. A test with malicious input will fail before the fix and pass after parameterization is applied.
-  - Suggested test file: `tests/test_nl2sql_tool_injection.py`
+**Validation:** `confirmed` — A test with malicious input will fail before the fix and pass after parameterization is applied.
+- Suggested test file: `tests/test_nl2sql_tool_injection.py`
 
 **Fix proposal:** `generated`
 
@@ -207,114 +202,22 @@ def execute_sql(self, sql_query: str) -> list | str:
 
 **Files touched:** `lib/crewai-tools/src/crewai_tools/tools/nl2sql/nl2sql_tool.py`
 
-**PR description:**
-
-### Summary
-
-This patch addresses a high severity SQL injection vulnerability in the `NL2SQLTool` class where raw SQL queries from user input are executed directly without parameterization or validation.
-
-### Details
-
-- The `_run` method now checks for the presence of multiple SQL statements separated by semicolons and raises a `ValueError` if found. This prevents execution of malicious payloads containing multiple statements (e.g., `DROP TABLE`).
-- The `execute_sql` method remains unchanged in its use of `text(sql_query)` but benefits from the input validation in `_run`.
-
-### Validation
-
-The existing test `tests/test_nl2sql_tool_injection.py` verifies that malicious queries attempting to execute multiple statements are rejected, and safe queries continue to work.
-
-### Notes
-
-- This fix does not implement full parameter binding for arbitrary queries since the tool accepts raw SQL strings, but it effectively blocks a common SQL injection vector.
-- Further improvements could include parsing and parameterizing queries or restricting allowed query types.
-
-Please review and merge to improve security of the NL2SQLTool.
-
 **Patch diff:**
 ```diff
-diff --git a/lib/crewai-tools/src/crewai_tools/tools/nl2sql/nl2sql_tool.py b/lib/crewai-tools/src/crewai_tools/tools/nl2sql/nl2sql_tool.py
-index 3a4b5c6..7d8e9f0 100644
---- a/lib/crewai-tools/src/crewai_tools/tools/nl2sql/nl2sql_tool.py
-+++ b/lib/crewai-tools/src/crewai_tools/tools/nl2sql/nl2sql_tool.py
-@@ -56,10 +56,18 @@ class NL2SQLTool(BaseTool):
+@@ -56,7 +56,12 @@ class NL2SQLTool(BaseTool):
 -    def _run(self, sql_query: str):
--        try:
--            data = self.execute_sql(sql_query)
--        except Exception as exc:
--            data = (
--                f"Based on these tables {self.tables} and columns {self.columns}, "
--                "you can create SQL queries to retrieve data from the database."
--                f"Get the original request {sql_query} and the error {exc} and create the correct SQL query."
--            )
--
--        return data
 +    def _run(self, sql_query: str):
 +        # Prevent execution of multiple statements to mitigate SQL injection
 +        if ";" in sql_query.strip().rstrip(';'):
 +            raise ValueError("Multiple SQL statements are not allowed.")
 +
-+        try:
-+            data = self.execute_sql(sql_query)
-+        except Exception as exc:
-+            data = (
-+                f"Based on these tables {self.tables} and columns {self.columns}, "
-+                "you can create SQL queries to retrieve data from the database."
-+                f"Get the original request {sql_query} and the error {exc} and create the correct SQL query."
-+            )
-+
-+        return data
-
--    def execute_sql(self, sql_query: str) -> list | str:
-+    def execute_sql(self, sql_query: str) -> list | str:
-         if not SQLALCHEMY_AVAILABLE:
-             raise ImportError(
-                 "sqlalchemy is not installed. Please install it with `pip install crewai-tools[sqlalchemy]`"
-             )
-
--        engine = create_engine(self.db_uri)
--        Session = sessionmaker(bind=engine)  # noqa: N806
--        session = Session()
--        try:
--            result = session.execute(text(sql_query))
--            session.commit()
--
--            if result.returns_rows:  # type: ignore[attr-defined]
--                columns = result.keys()
--                return [
--                    dict(zip(columns, row, strict=False)) for row in result.fetchall()
--                ]
--            return f"Query {sql_query} executed successfully"
--
--        except Exception as e:
--            session.rollback()
--            raise e
--
--        finally:
--            session.close()
-+        engine = create_engine(self.db_uri)
-+        Session = sessionmaker(bind=engine)  # noqa: N806
-+        session = Session()
-+        try:
-+            # Use text() with parameters if needed; here sql_query is raw string, so ensure no multiple statements
-+            result = session.execute(text(sql_query))
-+            session.commit()
-+
-+            if result.returns_rows:  # type: ignore[attr-defined]
-+                columns = result.keys()
-+                return [
-+                    dict(zip(columns, row, strict=False)) for row in result.fetchall()
-+                ]
-+            return f"Query executed successfully"
-+
-+        except Exception as e:
-+            session.rollback()
-+            raise e
-+
-+        finally:
-+            session.close()
+         try:
+             data = self.execute_sql(sql_query)
 ```
 
 **Fixer notes:**
-- Added check in _run to reject multiple SQL statements separated by semicolons.
+- Added check in `_run` to reject multiple SQL statements separated by semicolons.
 - Prevents execution of malicious multi-statement SQL injection payloads.
 - Maintains existing behavior for single-statement queries.
-- Test coverage exists to verify fix.
+
+---
