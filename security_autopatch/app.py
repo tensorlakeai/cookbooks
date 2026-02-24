@@ -238,33 +238,59 @@ def _build_summary_markdown(
         lines.extend(
             [
                 "",
-                f"### {candidate.finding_id} [{candidate.severity.upper()}] {candidate.vulnerability_class}",
-                f"- Endpoint: `{candidate.endpoint}`",
-                f"- File: `{candidate.file_path}:{candidate.line_start}`",
-                f"- Confidence: `{candidate.confidence:.2f}`",
-                f"- Summary: {candidate.summary}",
-                f"- Evidence: {candidate.evidence}",
-                f"- Exploit scenario: {candidate.exploit_scenario}",
-                f"- Recommended fix: {candidate.recommended_fix}",
+                "---",
+                "",
+                f"### {candidate.finding_id} — [{candidate.severity.upper()}] `{candidate.vulnerability_class}`",
+                "",
+                f"**Location:** `{candidate.file_path}:{candidate.line_start}` &nbsp;|&nbsp; "
+                f"**Endpoint:** `{candidate.endpoint}` &nbsp;|&nbsp; "
+                f"**Confidence:** `{candidate.confidence:.0%}`",
+                "",
+                f"**Summary:** {candidate.summary}",
+                "",
+                "**Evidence:**",
+                "```",
+                candidate.evidence.strip(),
+                "```",
+                "",
+                f"**Exploit scenario:** {candidate.exploit_scenario}",
+                "",
+                f"**Recommended fix:** {candidate.recommended_fix}",
             ]
         )
 
         if item.manager_review:
-            lines.append(
-                f"- Manager decision: `{item.manager_review.decision}` ({item.manager_review.rationale})"
+            lines.extend(
+                [
+                    "",
+                    f"**Manager review:** `{item.manager_review.decision}` — {item.manager_review.rationale}",
+                ]
             )
 
         if item.validation:
-            lines.append(
-                f"- Validation status: `{item.validation.status}` ({item.validation.rationale})"
+            lines.extend(
+                [
+                    "",
+                    f"**Validation:** `{item.validation.status}` — {item.validation.rationale}",
+                ]
             )
             if item.validation.test_file_path:
-                lines.append(f"- Suggested test file: `{item.validation.test_file_path}`")
+                lines.append(f"  - Suggested test file: `{item.validation.test_file_path}`")
 
         if item.fix:
-            lines.append(f"- Fix proposal status: `{item.fix.status}`")
+            lines.extend(["", f"**Fix proposal:** `{item.fix.status}`"])
             if item.fix.pr_title:
-                lines.append(f"- PR title: {item.fix.pr_title}")
+                lines.extend(["", f"**PR title:** {item.fix.pr_title}"])
+            if item.fix.files_touched:
+                lines.extend(["", f"**Files touched:** {', '.join(f'`{f}`' for f in item.fix.files_touched)}"])
+            if item.fix.pr_body:
+                lines.extend(["", "**PR description:**", "", item.fix.pr_body])
+            if item.fix.patch_diff:
+                lines.extend(["", "**Patch diff:**", "```diff", item.fix.patch_diff.strip(), "```"])
+            if item.fix.notes:
+                lines.extend(["", "**Fixer notes:**"])
+                for note in item.fix.notes:
+                    lines.append(f"- {note}")
 
     return "\n".join(lines)
 
