@@ -2,6 +2,7 @@ import fnmatch
 import json
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -276,7 +277,22 @@ def build_code_corpus(request: SecuritySweepRequest) -> list[FileSnippet]:
         if request.repo_branch:
             clone_cmd += ["--branch", request.repo_branch]
         clone_cmd += [request.repo_url, tmp]
-        subprocess.run(clone_cmd, check=True, capture_output=True)
+
+        safe_url = request.repo_url.split("@")[-1] if "@" in request.repo_url else request.repo_url
+        print(f"[build_code_corpus] Cloning {safe_url}" + (f" (branch: {request.repo_branch})" if request.repo_branch else " (default branch)"))
+
+        try:
+            result = subprocess.run(clone_cmd, check=True, capture_output=True, text=True)
+            if result.stderr:
+                print(f"[build_code_corpus] git clone output: {result.stderr.strip()}")
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr.strip() if exc.stderr else "(no output)"
+            print(f"[build_code_corpus] ERROR: git clone failed for {safe_url}")
+            print(f"[build_code_corpus] git stderr: {stderr}")
+            raise RuntimeError(
+                f"Failed to clone repository '{safe_url}': {stderr}"
+            ) from exc
+
         repo = Path(tmp)
     else:
         repo = _resolve_repo_path(request.repo_path)
@@ -735,15 +751,30 @@ def security_autopatch(request: SecuritySweepRequest) -> SecuritySweepReport:
 
 
 if __name__ == "__main__":
+    def _parse_list_env(name: str, default: list[str]) -> list[str]:
+        raw = os.getenv(name, "")
+        return [item.strip() for item in raw.split(",") if item.strip()] if raw.strip() else default
+
     sample_request = SecuritySweepRequest(
         repo_url=os.getenv("SCAN_REPO_URL", ""),
         repo_branch=os.getenv("SCAN_REPO_BRANCH", ""),
         repo_path=os.getenv("SCAN_REPO_PATH", "."),
-        include_globs=["**/*.py"],
-        exclude_globs=["**/.venv/**", "**/venv/**", "**/node_modules/**"],
-        vulnerability_classes=["idor", "sql_injection", "ssrf", "command_injection"],
+        include_globs=_parse_list_env("SCAN_INCLUDE_GLOBS", ["**/*.py"]),
+        exclude_globs=_parse_list_env(
+            "SCAN_EXCLUDE_GLOBS",
+            ["**/.venv/**", "**/venv/**", "**/node_modules/**"],
+        ),
+        vulnerability_classes=_parse_list_env(
+            "SCAN_VULN_CLASSES",
+            ["idor", "sql_injection", "ssrf", "command_injection"],
+        ),
     )
 
     local_request = run_local_application(security_autopatch, sample_request)
     report: SecuritySweepReport = local_request.output()
     print(report.summary_markdown)
+
+    report_path = os.getenv("SCAN_REPORT_PATH", "")
+    if report_path:
+        Path(report_path).write_text(report.summary_markdown, encoding="utf-8")
+        print(f"Report written to {report_path}", file=sys.stderr)

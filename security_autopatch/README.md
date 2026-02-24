@@ -80,6 +80,9 @@ All env var options:
 | `SCAN_REPO_URL` | _(empty)_ | Git URL to clone. If set, `SCAN_REPO_PATH` is ignored. |
 | `SCAN_REPO_BRANCH` | _(empty)_ | Branch or tag to clone. If unset, the remote's default branch is used. |
 | `SCAN_REPO_PATH` | `.` | Local path to scan (used when `SCAN_REPO_URL` is not set). |
+| `SCAN_INCLUDE_GLOBS` | `**/*.py` | Comma-separated glob patterns of files to include. |
+| `SCAN_EXCLUDE_GLOBS` | `**/.venv/**,**/venv/**,**/node_modules/**` | Comma-separated glob patterns of files to exclude. |
+| `SCAN_VULN_CLASSES` | `idor,sql_injection,ssrf,command_injection` | Comma-separated list of vulnerability classes to run. |
 | `SCAN_REPORT_PATH` | _(empty)_ | If set, the markdown report is also written to this file. |
 
 ## Deploy
@@ -91,7 +94,7 @@ tensorlake deploy app.py
 
 ## Invoke (Remote)
 
-Scan a public repository:
+Scan a public repository (wait for JSON result):
 
 ```bash
 curl -X POST https://api.tensorlake.ai/applications/security_autopatch \
