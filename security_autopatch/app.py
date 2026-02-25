@@ -169,137 +169,146 @@ async def _make_prompt_stream(content: str):
 #   - Runs until the agent calls the output tool or hits max_turns
 # ---------------------------------------------------------------------------
 
+async def _run_agent(
+    agent_name: str,
+    prompt: str,
+    options: "ClaudeAgentOptions",
+) -> dict:
+    """Run a single agent turn and return ResultMessage.structured_output.
+
+    Uses output_format on ClaudeAgentOptions so the model is forced to emit
+    structured JSON as its final response — no MCP tool round-trip needed.
+    Returns the parsed dict or {} if the agent failed / produced no output.
+    """
+    from claude_agent_sdk import (
+        query,
+        AssistantMessage,
+        ResultMessage,
+        SystemMessage,
+        TextBlock,
+        ToolUseBlock,
+    )
+
+    def _on_stderr(line: str) -> None:
+        print(f"[{agent_name}][stderr] {line}", flush=True)
+
+    options.stderr = _on_stderr
+
+    structured: dict = {}
+    turn = 0
+    async for message in query(prompt=_make_prompt_stream(prompt), options=options):
+        if isinstance(message, AssistantMessage):
+            turn += 1
+            for block in message.content:
+                if isinstance(block, ToolUseBlock):
+                    print(f"[{agent_name}] turn={turn} tool={block.name}", flush=True)
+                elif isinstance(block, TextBlock):
+                    preview = block.text[:200].replace("\n", " ")
+                    print(f"[{agent_name}] turn={turn} text={preview!r}", flush=True)
+        elif isinstance(message, ResultMessage):
+            print(
+                f"[{agent_name}] result subtype={message.subtype!r} "
+                f"is_error={message.is_error} turns={message.num_turns}",
+                flush=True,
+            )
+            if message.structured_output:
+                structured = message.structured_output
+            if message.is_error:
+                raise RuntimeError(
+                    f"[{agent_name}] agent error: subtype={message.subtype} "
+                    f"result={message.result}"
+                )
+        elif isinstance(message, SystemMessage):
+            print(f"[{agent_name}] system subtype={message.subtype!r}", flush=True)
+
+    print(
+        f"[{agent_name}] done. turns={turn} structured_output={bool(structured)}",
+        flush=True,
+    )
+    return structured
+
+
 async def _detector_agent(
     vulnerability_class: str,
     request: SecuritySweepRequest,
     snippets: list[FileSnippet],
 ) -> DetectorResult:
-    from claude_agent_sdk import (
-        query,
-        ClaudeAgentOptions,
-        tool as sdk_tool,
-        create_sdk_mcp_server,
-        AssistantMessage,
-        ResultMessage,
-    )
+    from claude_agent_sdk import ClaudeAgentOptions
 
     selected = _select_snippets_for_detector(
         snippets, vulnerability_class, request.max_files_per_detector
     )
     tmpdir = _write_snippets_to_tmpdir(selected)
 
-    result_holder: dict = {}
-
-    @sdk_tool(
-        "submit_findings",
-        "Submit your completed vulnerability analysis. Call this once you have "
-        "finished exploring the codebase and identified all findings.",
-        {
-            "type": "object",
-            "required": ["notes", "findings"],
-            "properties": {
-                "notes": {
-                    "type": "string",
-                    "description": "Summary of files examined and analysis methodology used",
-                },
-                "findings": {
-                    "type": "array",
-                    "description": "Confirmed exploitable findings (empty array if none found)",
-                    "items": {
-                        "type": "object",
-                        "required": [
-                            "vulnerability_class", "severity", "endpoint",
-                            "file_path", "line_start", "line_end", "summary",
-                            "evidence", "exploit_scenario", "confidence",
-                            "recommended_fix",
-                        ],
-                        "properties": {
-                            "vulnerability_class": {"type": "string"},
-                            "severity": {
-                                "type": "string",
-                                "enum": ["low", "medium", "high", "critical"],
+    options = ClaudeAgentOptions(
+        system_prompt=build_detector_skill(vulnerability_class),
+        allowed_tools=["Read", "Grep", "Glob"],
+        permission_mode="bypassPermissions",
+        cwd=tmpdir,
+        max_turns=30,
+        model=request.model,
+        output_format={
+            "type": "json_schema",
+            "schema": {
+                "type": "object",
+                "required": ["notes", "findings"],
+                "properties": {
+                    "notes": {"type": "string"},
+                    "findings": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": [
+                                "vulnerability_class", "severity", "endpoint",
+                                "file_path", "line_start", "line_end", "summary",
+                                "evidence", "exploit_scenario", "confidence",
+                                "recommended_fix",
+                            ],
+                            "properties": {
+                                "vulnerability_class": {"type": "string"},
+                                "severity": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
+                                "endpoint": {"type": "string"},
+                                "file_path": {"type": "string"},
+                                "line_start": {"type": "integer"},
+                                "line_end": {"type": "integer"},
+                                "summary": {"type": "string"},
+                                "evidence": {"type": "string"},
+                                "exploit_scenario": {"type": "string"},
+                                "confidence": {"type": "number"},
+                                "recommended_fix": {"type": "string"},
                             },
-                            "endpoint": {"type": "string"},
-                            "file_path": {"type": "string"},
-                            "line_start": {"type": "integer"},
-                            "line_end": {"type": "integer"},
-                            "summary": {"type": "string"},
-                            "evidence": {"type": "string"},
-                            "exploit_scenario": {"type": "string"},
-                            "confidence": {"type": "number"},
-                            "recommended_fix": {"type": "string"},
                         },
                     },
                 },
             },
         },
     )
-    async def submit_findings_fn(args):
-        result_holder["data"] = dict(args)
-        return {"content": [{"type": "text", "text": "Findings submitted."}]}
-
-    mcp_server = create_sdk_mcp_server("security_output", tools=[submit_findings_fn])
-
-    options = ClaudeAgentOptions(
-        system_prompt=build_detector_skill(vulnerability_class),
-        allowed_tools=[
-            "Read", "Grep", "Glob",
-            "mcp__security_output__submit_findings",
-        ],
-        mcp_servers={"security_output": mcp_server},
-        permission_mode="bypassPermissions",
-        cwd=tmpdir,
-        max_turns=30,
-        model=request.model,
-    )
 
     prompt = (
-        f"You are analyzing this Python codebase for **{vulnerability_class}** vulnerabilities.\n\n"
+        f"Analyze this Python codebase for **{vulnerability_class}** vulnerabilities.\n\n"
         f"Workflow:\n"
-        f"1. Use Glob(\"**/*.py\") to see all available files\n"
+        f"1. Use Glob(\"**/*.py\") to discover all files\n"
         f"2. Use Grep to search for vulnerability-specific patterns\n"
-        f"3. Use Read to examine suspicious files in detail and trace data flows\n"
-        f"4. Once you have thoroughly investigated, call submit_findings\n\n"
-        f"Report up to {request.max_findings_per_detector} findings. "
-        f"Only report realistic, exploitable vulnerabilities with concrete code evidence."
+        f"3. Use Read to examine suspicious files and trace data flows\n\n"
+        f"Report up to {request.max_findings_per_detector} confirmed, exploitable findings. "
+        f"Return an empty findings array if nothing is found."
     )
 
-    async for message in query(
-        prompt=_make_prompt_stream(prompt), options=options
-    ):
-        if isinstance(message, AssistantMessage):
-            for block in message.content:
-                if hasattr(block, "name"):
-                    print(f"[detector:{vulnerability_class}] tool={block.name}")
-        elif isinstance(message, ResultMessage):
-            if message.subtype == "error_during_execution":
-                raise RuntimeError(f"Detector agent execution error: {message}")
+    raw = await _run_agent(f"detector:{vulnerability_class}", prompt, options)
 
-    if not result_holder.get("data"):
-        return DetectorResult(
-            vulnerability_class=vulnerability_class,
-            notes="Agent completed without submitting findings (hit max_turns or error)",
-            findings=[],
-        )
-
-    raw = result_holder["data"]
     findings: list[CandidateFinding] = []
     for idx, f in enumerate(
         raw.get("findings", [])[: request.max_findings_per_detector], start=1
     ):
         findings.append(
             CandidateFinding.model_validate(
-                {
-                    **f,
-                    "finding_id": f"{vulnerability_class}-{idx}",
-                    "vulnerability_class": vulnerability_class,
-                }
+                {**f, "finding_id": f"{vulnerability_class}-{idx}", "vulnerability_class": vulnerability_class}
             )
         )
 
     return DetectorResult(
         vulnerability_class=vulnerability_class,
-        notes=raw.get("notes", ""),
+        notes=raw.get("notes", "Agent produced no structured output"),
         findings=findings,
     )
 
@@ -309,57 +318,31 @@ async def _manager_agent(
     request: SecuritySweepRequest,
     snippets: list[FileSnippet],
 ) -> ManagerReview:
-    from claude_agent_sdk import (
-        query,
-        ClaudeAgentOptions,
-        tool as sdk_tool,
-        create_sdk_mcp_server,
-        AssistantMessage,
-        ResultMessage,
-    )
+    from claude_agent_sdk import ClaudeAgentOptions
 
     relevant = _snippets_for_finding(finding, snippets)
     tmpdir = _write_snippets_to_tmpdir(relevant)
 
-    result_holder: dict = {}
-
-    @sdk_tool(
-        "submit_review",
-        "Submit your adversarial review decision after examining the finding and code.",
-        {
-            "type": "object",
-            "required": ["finding_id", "decision", "rationale", "requested_followups"],
-            "properties": {
-                "finding_id": {"type": "string"},
-                "decision": {
-                    "type": "string",
-                    "enum": ["approved", "rejected", "needs_human"],
-                },
-                "rationale": {"type": "string"},
-                "requested_followups": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                },
-            },
-        },
-    )
-    async def submit_review_fn(args):
-        result_holder["data"] = dict(args)
-        return {"content": [{"type": "text", "text": "Review submitted."}]}
-
-    mcp_server = create_sdk_mcp_server("security_output", tools=[submit_review_fn])
-
     options = ClaudeAgentOptions(
         system_prompt=MANAGER_SKILL,
-        allowed_tools=[
-            "Read", "Grep",
-            "mcp__security_output__submit_review",
-        ],
-        mcp_servers={"security_output": mcp_server},
+        allowed_tools=["Read", "Grep"],
         permission_mode="bypassPermissions",
         cwd=tmpdir,
         max_turns=15,
         model=request.model,
+        output_format={
+            "type": "json_schema",
+            "schema": {
+                "type": "object",
+                "required": ["finding_id", "decision", "rationale", "requested_followups"],
+                "properties": {
+                    "finding_id": {"type": "string"},
+                    "decision": {"type": "string", "enum": ["approved", "rejected", "needs_human"]},
+                    "rationale": {"type": "string"},
+                    "requested_followups": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+        },
     )
 
     prompt = (
@@ -369,29 +352,20 @@ async def _manager_agent(
         f"Use Read to examine the vulnerable code and Grep to search for "
         f"any mitigations (middleware, decorators, authorization checks) "
         f"that might have been missed by the detector.\n\n"
-        f"Then call submit_review with your decision."
+        f"Output your review decision as JSON."
     )
 
-    async for message in query(
-        prompt=_make_prompt_stream(prompt), options=options
-    ):
-        if isinstance(message, AssistantMessage):
-            for block in message.content:
-                if hasattr(block, "name"):
-                    print(f"[manager:{finding.finding_id}] tool={block.name}")
-        elif isinstance(message, ResultMessage):
-            if message.subtype == "error_during_execution":
-                raise RuntimeError(f"Manager agent error: {message}")
+    raw = await _run_agent(f"manager:{finding.finding_id}", prompt, options)
 
-    if not result_holder.get("data"):
+    if not raw:
         return ManagerReview(
             finding_id=finding.finding_id,
             decision="needs_human",
-            rationale="Manager agent completed without submitting a review",
+            rationale="Manager agent produced no structured output",
             requested_followups=["Manual analyst review required"],
         )
 
-    raw = result_holder["data"]
+    raw.setdefault("finding_id", finding.finding_id)
     review = ManagerReview.model_validate(raw)
     if review.finding_id != finding.finding_id:
         review = review.model_copy(update={"finding_id": finding.finding_id})
@@ -404,62 +378,33 @@ async def _validator_agent(
     request: SecuritySweepRequest,
     snippets: list[FileSnippet],
 ) -> ValidationResult:
-    from claude_agent_sdk import (
-        query,
-        ClaudeAgentOptions,
-        tool as sdk_tool,
-        create_sdk_mcp_server,
-        AssistantMessage,
-        ResultMessage,
-    )
+    from claude_agent_sdk import ClaudeAgentOptions
 
     relevant = _snippets_for_finding(finding, snippets)
     tmpdir = _write_snippets_to_tmpdir(relevant)
 
-    result_holder: dict = {}
-
-    @sdk_tool(
-        "submit_validation",
-        "Submit the validation result with a test that confirms or refutes the finding.",
-        {
-            "type": "object",
-            "required": [
-                "finding_id", "status", "rationale",
-                "test_file_path", "test_code", "run_command",
-            ],
-            "properties": {
-                "finding_id": {"type": "string"},
-                "status": {
-                    "type": "string",
-                    "enum": ["confirmed", "false_positive", "needs_human"],
-                },
-                "rationale": {"type": "string"},
-                "test_file_path": {"type": "string"},
-                "test_code": {
-                    "type": "string",
-                    "description": "Complete runnable pytest test that fails before fix, passes after",
-                },
-                "run_command": {"type": "string"},
-            },
-        },
-    )
-    async def submit_validation_fn(args):
-        result_holder["data"] = dict(args)
-        return {"content": [{"type": "text", "text": "Validation submitted."}]}
-
-    mcp_server = create_sdk_mcp_server("security_output", tools=[submit_validation_fn])
-
     options = ClaudeAgentOptions(
         system_prompt=VALIDATOR_SKILL,
-        allowed_tools=[
-            "Read", "Grep", "Glob",
-            "mcp__security_output__submit_validation",
-        ],
-        mcp_servers={"security_output": mcp_server},
+        allowed_tools=["Read", "Grep", "Glob"],
         permission_mode="bypassPermissions",
         cwd=tmpdir,
         max_turns=20,
         model=request.model,
+        output_format={
+            "type": "json_schema",
+            "schema": {
+                "type": "object",
+                "required": ["finding_id", "status", "rationale", "test_file_path", "test_code", "run_command"],
+                "properties": {
+                    "finding_id": {"type": "string"},
+                    "status": {"type": "string", "enum": ["confirmed", "false_positive", "needs_human"]},
+                    "rationale": {"type": "string"},
+                    "test_file_path": {"type": "string"},
+                    "test_code": {"type": "string"},
+                    "run_command": {"type": "string"},
+                },
+            },
+        },
     )
 
     prompt = (
@@ -467,37 +412,26 @@ async def _validator_agent(
         f"**Finding:**\n```json\n{json.dumps(finding.model_dump(), indent=2)}\n```\n\n"
         f"**Manager review:**\n```json\n{json.dumps(manager_review.model_dump(), indent=2)}\n```\n\n"
         f"The relevant source files are in your working directory. "
-        f"Use Read to understand the code structure, and Glob to discover any existing test files "
-        f"(to match testing patterns already used in this project).\n\n"
-        f"Write an integration test that:\n"
-        f"- FAILS without the security fix (reproduces the vulnerability)\n"
-        f"- PASSES after the fix is applied\n\n"
+        f"Use Read to understand the code structure and Glob to discover existing test files.\n\n"
+        f"Write an integration test that FAILS without the fix and PASSES after.\n"
         f"Default test command: `{request.test_command}`\n\n"
-        f"Then call submit_validation."
+        f"Output your validation result as JSON."
     )
 
-    async for message in query(
-        prompt=_make_prompt_stream(prompt), options=options
-    ):
-        if isinstance(message, AssistantMessage):
-            for block in message.content:
-                if hasattr(block, "name"):
-                    print(f"[validator:{finding.finding_id}] tool={block.name}")
-        elif isinstance(message, ResultMessage):
-            if message.subtype == "error_during_execution":
-                raise RuntimeError(f"Validator agent error: {message}")
+    raw = await _run_agent(f"validator:{finding.finding_id}", prompt, options)
 
-    if not result_holder.get("data"):
+    if not raw:
         return ValidationResult(
             finding_id=finding.finding_id,
             status="needs_human",
-            rationale="Validator agent completed without submitting a result",
+            rationale="Validator agent produced no structured output",
             test_file_path=f"tests/security/test_{finding.finding_id}.py",
             test_code="",
             run_command=request.test_command,
         )
 
-    raw = result_holder["data"]
+    raw.setdefault("finding_id", finding.finding_id)
+    raw.setdefault("run_command", request.test_command)
     validation = ValidationResult.model_validate(raw)
     if validation.finding_id != finding.finding_id:
         validation = validation.model_copy(update={"finding_id": finding.finding_id})
@@ -510,66 +444,34 @@ async def _fixer_agent(
     request: SecuritySweepRequest,
     snippets: list[FileSnippet],
 ) -> FixProposal:
-    from claude_agent_sdk import (
-        query,
-        ClaudeAgentOptions,
-        tool as sdk_tool,
-        create_sdk_mcp_server,
-        AssistantMessage,
-        ResultMessage,
-    )
+    from claude_agent_sdk import ClaudeAgentOptions
 
     relevant = _snippets_for_finding(finding, snippets)
     tmpdir = _write_snippets_to_tmpdir(relevant)
 
-    result_holder: dict = {}
-
-    @sdk_tool(
-        "submit_patch",
-        "Submit the minimal patch proposal for this confirmed vulnerability.",
-        {
-            "type": "object",
-            "required": [
-                "finding_id", "status", "patch_diff",
-                "files_touched", "pr_title", "pr_body", "notes",
-            ],
-            "properties": {
-                "finding_id": {"type": "string"},
-                "status": {
-                    "type": "string",
-                    "enum": ["generated", "skipped", "failed"],
-                },
-                "patch_diff": {
-                    "type": "string",
-                    "description": "Unified diff format patch",
-                },
-                "files_touched": {"type": "array", "items": {"type": "string"}},
-                "pr_title": {"type": "string"},
-                "pr_body": {
-                    "type": "string",
-                    "description": "Markdown-formatted PR description",
-                },
-                "notes": {"type": "array", "items": {"type": "string"}},
-            },
-        },
-    )
-    async def submit_patch_fn(args):
-        result_holder["data"] = dict(args)
-        return {"content": [{"type": "text", "text": "Patch submitted."}]}
-
-    mcp_server = create_sdk_mcp_server("security_output", tools=[submit_patch_fn])
-
     options = ClaudeAgentOptions(
         system_prompt=FIXER_SKILL,
-        allowed_tools=[
-            "Read", "Grep",
-            "mcp__security_output__submit_patch",
-        ],
-        mcp_servers={"security_output": mcp_server},
+        allowed_tools=["Read", "Grep"],
         permission_mode="bypassPermissions",
         cwd=tmpdir,
         max_turns=20,
         model=request.model,
+        output_format={
+            "type": "json_schema",
+            "schema": {
+                "type": "object",
+                "required": ["finding_id", "status", "patch_diff", "files_touched", "pr_title", "pr_body", "notes"],
+                "properties": {
+                    "finding_id": {"type": "string"},
+                    "status": {"type": "string", "enum": ["generated", "skipped", "failed"]},
+                    "patch_diff": {"type": "string"},
+                    "files_touched": {"type": "array", "items": {"type": "string"}},
+                    "pr_title": {"type": "string"},
+                    "pr_body": {"type": "string"},
+                    "notes": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+        },
     )
 
     prompt = (
@@ -579,30 +481,20 @@ async def _fixer_agent(
         f"The vulnerable source files are in your working directory. "
         f"Use Read to examine the exact code at {finding.file_path} lines "
         f"{finding.line_start}–{finding.line_end} and any surrounding context.\n\n"
-        f"Your patch must make the validator test pass. Keep the diff minimal "
-        f"(only change what is necessary to fix the vulnerability).\n\n"
-        f"Then call submit_patch."
+        f"Keep the diff minimal — only change what is necessary.\n\n"
+        f"Output your patch proposal as JSON."
     )
 
-    async for message in query(
-        prompt=_make_prompt_stream(prompt), options=options
-    ):
-        if isinstance(message, AssistantMessage):
-            for block in message.content:
-                if hasattr(block, "name"):
-                    print(f"[fixer:{finding.finding_id}] tool={block.name}")
-        elif isinstance(message, ResultMessage):
-            if message.subtype == "error_during_execution":
-                raise RuntimeError(f"Fixer agent error: {message}")
+    raw = await _run_agent(f"fixer:{finding.finding_id}", prompt, options)
 
-    if not result_holder.get("data"):
+    if not raw:
         return FixProposal(
             finding_id=finding.finding_id,
             status="failed",
-            notes=["Fixer agent completed without submitting a patch"],
+            notes=["Fixer agent produced no structured output"],
         )
 
-    raw = result_holder["data"]
+    raw.setdefault("finding_id", finding.finding_id)
     proposal = FixProposal.model_validate(raw)
     if proposal.finding_id != finding.finding_id:
         proposal = proposal.model_copy(update={"finding_id": finding.finding_id})
