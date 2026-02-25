@@ -10,8 +10,8 @@ Architecture (mirrors Ramp's "100 vulnerabilities patched with 0 humans"):
 
 Each stage function is a synchronous Tensorlake @function that calls asyncio.run()
 on an async Claude Agent SDK session.  The agents use native filesystem tools
-(Read, Grep, Glob) to explore the code and custom in-process MCP tools to emit
-structured results back to the coordinator.
+(Read, Grep, Glob) to explore the code and output_format/structured_output to
+return typed JSON results back to the coordinator without any MCP round-trip.
 """
 
 import asyncio
@@ -235,10 +235,8 @@ async def _detector_agent(
 ) -> DetectorResult:
     from claude_agent_sdk import ClaudeAgentOptions
 
-    selected = _select_snippets_for_detector(
-        snippets, vulnerability_class, request.max_files_per_detector
-    )
-    tmpdir = _write_snippets_to_tmpdir(selected)
+    # snippets are already pre-selected by the coordinator
+    tmpdir = _write_snippets_to_tmpdir(snippets)
 
     options = ClaudeAgentOptions(
         system_prompt=build_detector_skill(vulnerability_class),
@@ -320,8 +318,7 @@ async def _manager_agent(
 ) -> ManagerReview:
     from claude_agent_sdk import ClaudeAgentOptions
 
-    relevant = _snippets_for_finding(finding, snippets)
-    tmpdir = _write_snippets_to_tmpdir(relevant)
+    tmpdir = _write_snippets_to_tmpdir(snippets)
 
     options = ClaudeAgentOptions(
         system_prompt=MANAGER_SKILL,
@@ -380,8 +377,7 @@ async def _validator_agent(
 ) -> ValidationResult:
     from claude_agent_sdk import ClaudeAgentOptions
 
-    relevant = _snippets_for_finding(finding, snippets)
-    tmpdir = _write_snippets_to_tmpdir(relevant)
+    tmpdir = _write_snippets_to_tmpdir(snippets)
 
     options = ClaudeAgentOptions(
         system_prompt=VALIDATOR_SKILL,
@@ -446,8 +442,7 @@ async def _fixer_agent(
 ) -> FixProposal:
     from claude_agent_sdk import ClaudeAgentOptions
 
-    relevant = _snippets_for_finding(finding, snippets)
-    tmpdir = _write_snippets_to_tmpdir(relevant)
+    tmpdir = _write_snippets_to_tmpdir(snippets)
 
     options = ClaudeAgentOptions(
         system_prompt=FIXER_SKILL,
@@ -844,7 +839,14 @@ def security_autopatch(request: SecuritySweepRequest) -> SecuritySweepReport:
     )
 
     detector_futures: list[Future] = [
-        run_detector.awaitable(vuln_class, request, snippets).run()
+        run_detector.awaitable(
+            vuln_class,
+            request,
+            # Pre-select relevant snippets here so each container receives
+            # only max_files_per_detector files (~160KB) instead of the full
+            # corpus (~7MB for 879 files).
+            _select_snippets_for_detector(snippets, vuln_class, request.max_files_per_detector),
+        ).run()
         for vuln_class in request.vulnerability_classes
     ]
     Future.wait(detector_futures, return_when=RETURN_WHEN.ALL_COMPLETED)
@@ -874,7 +876,13 @@ def security_autopatch(request: SecuritySweepRequest) -> SecuritySweepReport:
         ctx.progress.update(3, 6, f"Manager triage: {len(candidates)} findings", {})
 
         manager_futures: dict[str, Future] = {
-            f.finding_id: run_manager_review.awaitable(f, request, snippets).run()
+            f.finding_id: run_manager_review.awaitable(
+                f,
+                request,
+                # Pre-filter to the handful of files relevant to this finding
+                # so each container receives ~50KB instead of the full corpus.
+                _snippets_for_finding(f, snippets),
+            ).run()
             for f in candidates
         }
         Future.wait(manager_futures.values(), return_when=RETURN_WHEN.ALL_COMPLETED)
@@ -908,7 +916,7 @@ def security_autopatch(request: SecuritySweepRequest) -> SecuritySweepReport:
             if mgr is None:
                 continue
             validator_futures[finding.finding_id] = run_validator.awaitable(
-                finding, mgr, request, snippets
+                finding, mgr, request, _snippets_for_finding(finding, snippets)
             ).run()
 
         Future.wait(validator_futures.values(), return_when=RETURN_WHEN.ALL_COMPLETED)
@@ -953,7 +961,7 @@ def security_autopatch(request: SecuritySweepRequest) -> SecuritySweepReport:
             if val is None:
                 continue
             fixer_futures[finding.finding_id] = run_fixer.awaitable(
-                finding, val, request, snippets
+                finding, val, request, _snippets_for_finding(finding, snippets)
             ).run()
 
         Future.wait(fixer_futures.values(), return_when=RETURN_WHEN.ALL_COMPLETED)
