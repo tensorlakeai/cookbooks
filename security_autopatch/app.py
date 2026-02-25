@@ -241,6 +241,7 @@ async def _detector_agent(
     options = ClaudeAgentOptions(
         system_prompt=build_detector_skill(vulnerability_class),
         allowed_tools=["Read", "Grep", "Glob"],
+        disallowed_tools=["Edit", "Write", "Bash", "MultiEdit", "NotebookEdit"],
         permission_mode="bypassPermissions",
         cwd=tmpdir,
         max_turns=30,
@@ -323,6 +324,7 @@ async def _manager_agent(
     options = ClaudeAgentOptions(
         system_prompt=MANAGER_SKILL,
         allowed_tools=["Read", "Grep"],
+        disallowed_tools=["Edit", "Write", "Bash", "MultiEdit", "NotebookEdit"],
         permission_mode="bypassPermissions",
         cwd=tmpdir,
         max_turns=15,
@@ -382,9 +384,10 @@ async def _validator_agent(
     options = ClaudeAgentOptions(
         system_prompt=VALIDATOR_SKILL,
         allowed_tools=["Read", "Grep", "Glob"],
+        disallowed_tools=["Edit", "Write", "Bash", "MultiEdit", "NotebookEdit"],
         permission_mode="bypassPermissions",
         cwd=tmpdir,
-        max_turns=20,
+        max_turns=30,
         model=request.model,
         output_format={
             "type": "json_schema",
@@ -408,8 +411,13 @@ async def _validator_agent(
         f"**Finding:**\n```json\n{json.dumps(finding.model_dump(), indent=2)}\n```\n\n"
         f"**Manager review:**\n```json\n{json.dumps(manager_review.model_dump(), indent=2)}\n```\n\n"
         f"The relevant source files are in your working directory. "
-        f"Use Read to understand the code structure and Glob to discover existing test files.\n\n"
-        f"Write an integration test that FAILS without the fix and PASSES after.\n"
+        f"Use Read to understand the code structure and Glob to discover existing test files "
+        f"(to match the project's testing patterns).\n\n"
+        f"**IMPORTANT**: Your job is ONLY to WRITE the test code — do NOT edit source files, "
+        f"do NOT apply any fix, and do NOT run any commands. "
+        f"Just read the code, reason about the vulnerability, and produce test code that:\n"
+        f"  - Would FAIL on the current vulnerable code (it calls the buggy code path)\n"
+        f"  - Would PASS after the minimal fix is applied\n\n"
         f"Default test command: `{request.test_command}`\n\n"
         f"Output your validation result as JSON."
     )
@@ -447,6 +455,7 @@ async def _fixer_agent(
     options = ClaudeAgentOptions(
         system_prompt=FIXER_SKILL,
         allowed_tools=["Read", "Grep"],
+        disallowed_tools=["Edit", "Write", "Bash", "MultiEdit", "NotebookEdit"],
         permission_mode="bypassPermissions",
         cwd=tmpdir,
         max_turns=20,
