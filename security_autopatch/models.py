@@ -91,7 +91,7 @@ class SecuritySweepRequest(BaseModel):
     max_files_per_detector: int = Field(default=20, ge=1, le=200)
     max_chars_per_file: int = Field(default=8000, ge=200, le=200000)
     max_findings_per_detector: int = Field(default=5, ge=1, le=20)
-    model: str = "gpt-4.1-mini"
+    model: str = "claude-sonnet-4-6"
     test_command: str = "pytest -q"
     run_validation: bool = True
     generate_fixes: bool = True
