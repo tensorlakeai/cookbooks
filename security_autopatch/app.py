@@ -860,7 +860,7 @@ def security_autopatch(request: SecuritySweepRequest) -> SecuritySweepReport:
     )
 
     detector_futures: list[Future] = [
-        run_detector.awaitable(vuln_class, request, snippets).run()
+        run_detector.future(vuln_class, request, snippets).run()
         for vuln_class in request.vulnerability_classes
     ]
     Future.wait(detector_futures, return_when=RETURN_WHEN.ALL_COMPLETED)
@@ -890,7 +890,7 @@ def security_autopatch(request: SecuritySweepRequest) -> SecuritySweepReport:
         ctx.progress.update(3, 6, f"Manager triage: {len(candidates)} findings", {})
 
         manager_futures: dict[str, Future] = {
-            f.finding_id: run_manager_review.awaitable(
+            f.finding_id: run_manager_review.future(
                 f,
                 request,
                 # Pre-filter to the handful of files relevant to this finding
@@ -929,7 +929,7 @@ def security_autopatch(request: SecuritySweepRequest) -> SecuritySweepReport:
             mgr = lifecycle_by_id[finding.finding_id].manager_review
             if mgr is None:
                 continue
-            validator_futures[finding.finding_id] = run_validator.awaitable(
+            validator_futures[finding.finding_id] = run_validator.future(
                 finding, mgr, request, _snippets_for_finding(finding, snippets)
             ).run()
 
@@ -974,7 +974,7 @@ def security_autopatch(request: SecuritySweepRequest) -> SecuritySweepReport:
             val = lifecycle_by_id[finding.finding_id].validation
             if val is None:
                 continue
-            fixer_futures[finding.finding_id] = run_fixer.awaitable(
+            fixer_futures[finding.finding_id] = run_fixer.future(
                 finding, val, request, _snippets_for_finding(finding, snippets)
             ).run()
 
