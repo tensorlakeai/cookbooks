@@ -1,12 +1,28 @@
+"""Security Autopatch — Coordinator + multi-turn Claude Agent SDK sub-agents.
+
+Architecture (mirrors Ramp's "100 vulnerabilities patched with 0 humans"):
+  Coordinator (Tensorlake) orchestrates 5 stages, fanning out in parallel:
+    1. build_code_corpus   — clone/scan repo, return file snippets
+    2. run_detector        — Claude agent iterates with Read/Grep/Glob per vuln class
+    3. run_manager_review  — Claude agent adversarially reviews each finding
+    4. run_validator       — Claude agent writes integration tests per finding
+    5. run_fixer           — Claude agent generates minimal patches
+
+Each stage function is a synchronous Tensorlake @function that calls asyncio.run()
+on an async Claude Agent SDK session.  The agents use native filesystem tools
+(Read, Grep, Glob) to explore the code and output_format/structured_output to
+return typed JSON results back to the coordinator without any MCP round-trip.
+"""
+
+import asyncio
 import fnmatch
 import json
 import os
+import pwd
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-
-from openai import OpenAI
 
 from tensorlake.applications import (
     Future,
@@ -31,21 +47,61 @@ from models import (
     ValidationResult,
 )
 from prompts import (
-    FIXER_PROMPT,
-    KEYWORDS_BY_CLASS,
-    MANAGER_PROMPT,
-    ROUTE_HINTS,
-    VALIDATOR_PROMPT,
-    build_detector_prompt,
+    FIXER_SKILL,
+    MANAGER_SKILL,
+    VALIDATOR_SKILL,
+    build_detector_skill,
 )
 
+
+# ---------------------------------------------------------------------------
+# Docker image
+# The Claude Agent SDK (Python) spawns the Claude Code CLI as a subprocess,
+# so Node.js and @anthropic-ai/claude-code must be installed alongside it.
+# ---------------------------------------------------------------------------
 
 security_image = (
-    Image(name="security-autopatch")
-    .run("apt-get update && apt-get install -y git")
-    .run("pip install openai pydantic")
+    Image(name="security-autopatch-claude-sdk")
+    .run("apt-get update && apt-get install -y git curl")
+    .run(
+        "curl -fsSL https://deb.nodesource.com/setup_20.x | bash - "
+        "&& apt-get install -y nodejs"
+    )
+    .run("npm install -g @anthropic-ai/claude-code")
+    .run("pip install claude-agent-sdk pydantic")
+    # Create a non-root user so Claude Code CLI accepts --dangerously-skip-permissions.
+    # The flag is rejected when the process runs as root (UID 0).
+    .run("useradd -m -s /bin/bash appuser")
 )
 
+
+# ---------------------------------------------------------------------------
+# Privilege helpers
+# ---------------------------------------------------------------------------
+
+def _ensure_nonroot() -> None:
+    """Drop from root to 'appuser' so Claude Code CLI accepts --dangerously-skip-permissions.
+
+    The claude binary refuses the flag when UID == 0.  Each Tensorlake container
+    starts as root, so we permanently drop privileges at the top of every agent
+    @function before spawning the Claude Agent SDK subprocess.
+    """
+    if os.getuid() != 0:
+        return  # already non-root, nothing to do
+    try:
+        pw = pwd.getpwnam("appuser")
+        os.setgroups([])
+        os.setgid(pw.pw_gid)
+        os.setuid(pw.pw_uid)
+        os.environ["HOME"] = pw.pw_dir
+        print("[privilege] Dropped to appuser (uid=%d)" % pw.pw_uid, flush=True)
+    except (KeyError, PermissionError) as exc:
+        print(f"[privilege] WARNING: could not drop to appuser: {exc}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Snippet utilities
+# ---------------------------------------------------------------------------
 
 def _resolve_repo_path(repo_path: str) -> Path:
     resolved = Path(repo_path).expanduser().resolve()
@@ -55,13 +111,6 @@ def _resolve_repo_path(repo_path: str) -> Path:
 
 
 def _match_glob(path: str, pattern: str) -> bool:
-    """Match path against a glob pattern.
-
-    Both fnmatch and Path.match require at least one directory separator for
-    patterns like ``**/*.py``, so root-level files are never matched by those
-    helpers alone.  When the pattern starts with ``**/`` we therefore also
-    test the path against the tail of the pattern (the part after ``**/``).
-    """
     if fnmatch.fnmatch(path, pattern):
         return True
     if pattern.startswith("**/"):
@@ -71,111 +120,604 @@ def _match_glob(path: str, pattern: str) -> bool:
 
 def _matches_globs(path: str, include_globs: list[str], exclude_globs: list[str]) -> bool:
     include_ok = True if not include_globs else any(
-        _match_glob(path, pattern) for pattern in include_globs
+        _match_glob(path, p) for p in include_globs
     )
     if not include_ok:
         return False
-    return not any(_match_glob(path, pattern) for pattern in exclude_globs)
-
-
-def _parse_json_object(raw: str) -> dict:
-    text = raw.strip()
-    if text.startswith("```"):
-        chunks = text.split("```")
-        if len(chunks) >= 3:
-            text = chunks[1].strip()
-            if text.lower().startswith("json"):
-                text = text[4:].strip()
-    start = text.find("{")
-    end = text.rfind("}")
-    if start < 0 or end < 0 or end < start:
-        raise ValueError("LLM response did not include a JSON object")
-    return json.loads(text[start : end + 1])
-
-
-def _call_llm_json(system_prompt: str, payload: dict, model: str) -> dict:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "OPENAI_API_KEY is not set. Add it as a Tensorlake secret for this application."
-        )
-
-    client = OpenAI(api_key=api_key, max_retries=0)
-    response = client.chat.completions.create(
-        model=model,
-        temperature=0,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": json.dumps(payload, ensure_ascii=False),
-            },
-        ],
-    )
-    content = response.choices[0].message.content or "{}"
-    return _parse_json_object(content)
-
-
-def _score_snippet(snippet: FileSnippet, vulnerability_class: str) -> int:
-    keywords = KEYWORDS_BY_CLASS.get(vulnerability_class, [])
-    content = snippet.content.lower()
-    path = snippet.path.lower()
-
-    score = 0
-    for keyword in keywords:
-        score += content.count(keyword.lower()) * 2
-
-    for hint in ROUTE_HINTS:
-        if hint in content:
-            score += 2
-
-    if any(token in path for token in ("route", "api", "handler", "controller", "endpoint")):
-        score += 2
-
-    return score
-
-
-def _select_snippets_for_detector(
-    snippets: list[FileSnippet], vulnerability_class: str, limit: int
-) -> list[FileSnippet]:
-    ranked = sorted(
-        snippets,
-        key=lambda snippet: (_score_snippet(snippet, vulnerability_class), snippet.path),
-        reverse=True,
-    )
-
-    selected = ranked[:limit]
-    if not selected:
-        return []
-
-    # If everything scored zero, still scan deterministically to avoid empty context.
-    if _score_snippet(selected[0], vulnerability_class) == 0:
-        return sorted(snippets, key=lambda snippet: snippet.path)[:limit]
-
-    return selected
+    return not any(_match_glob(path, p) for p in exclude_globs)
 
 
 def _snippets_for_finding(
     finding: CandidateFinding, snippets: list[FileSnippet], limit: int = 6
 ) -> list[FileSnippet]:
-    exact = [snippet for snippet in snippets if snippet.path == finding.file_path]
+    """Return the file containing the finding plus a few nearby files for context."""
+    exact = [s for s in snippets if s.path == finding.file_path]
     if exact:
         return exact[:limit]
-
-    # Fallback: use vulnerability-specific ranking if exact path was not included in corpus.
-    return _select_snippets_for_detector(snippets, finding.vulnerability_class, limit)
+    return sorted(snippets, key=lambda s: s.path)[:limit]
 
 
 def _severity_rank(severity: str) -> int:
-    ranks = {
-        "critical": 0,
-        "high": 1,
-        "medium": 2,
-        "low": 3,
-    }
-    return ranks.get(severity.lower(), 4)
+    return {"critical": 0, "high": 1, "medium": 2, "low": 3}.get(severity.lower(), 4)
 
+
+def _write_snippets_to_tmpdir(snippets: list[FileSnippet]) -> str:
+    """Write file snippets to a temp directory so agents can use Read/Grep/Glob."""
+    tmpdir = tempfile.mkdtemp()
+    for snippet in snippets:
+        file_path = Path(tmpdir) / snippet.path
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(snippet.content, encoding="utf-8")
+    return tmpdir
+
+
+async def _make_prompt_stream(content: str):
+    """Async generator wrapping a string prompt.
+
+    Custom in-process MCP tools require streaming (async generator) input format —
+    a plain string prompt does not work when mcp_servers contains SDK servers.
+    """
+    yield {"type": "user", "message": {"role": "user", "content": content}}
+
+
+# ---------------------------------------------------------------------------
+# Async agent runners
+# Each function runs a full multi-turn Claude Agent SDK session:
+#   - Writes relevant snippets to a tmpdir (native filesystem tools work)
+#   - Gives the agent Read / Grep / Glob for iterative code exploration
+#   - Registers a custom MCP tool to capture structured output
+#   - Runs until the agent calls the output tool or hits max_turns
+# ---------------------------------------------------------------------------
+
+async def _run_agent(
+    agent_name: str,
+    prompt: str,
+    options: "ClaudeAgentOptions",
+) -> dict:
+    """Run a single agent turn and return ResultMessage.structured_output.
+
+    Uses output_format on ClaudeAgentOptions so the model is forced to emit
+    structured JSON as its final response — no MCP tool round-trip needed.
+    Returns the parsed dict or {} if the agent failed / produced no output.
+    """
+    from claude_agent_sdk import (
+        query,
+        AssistantMessage,
+        ResultMessage,
+        SystemMessage,
+        TextBlock,
+        ThinkingBlock,
+        ToolUseBlock,
+    )
+
+    def _on_stderr(line: str) -> None:
+        print(f"[{agent_name}][stderr] {line}", flush=True)
+
+    options.stderr = _on_stderr
+
+    structured: dict = {}
+    turn = 0
+    async for message in query(prompt=_make_prompt_stream(prompt), options=options):
+        if isinstance(message, AssistantMessage):
+            turn += 1
+            for block in message.content:
+                if isinstance(block, ThinkingBlock):
+                    lines = block.thinking.replace("\n", "\n    ")
+                    print(f"[{agent_name}] turn={turn} THINKING:\n    {lines}", flush=True)
+                elif isinstance(block, ToolUseBlock):
+                    print(f"[{agent_name}] turn={turn} tool={block.name}", flush=True)
+                elif isinstance(block, TextBlock):
+                    preview = block.text[:200].replace("\n", " ")
+                    print(f"[{agent_name}] turn={turn} text={preview!r}", flush=True)
+        elif isinstance(message, ResultMessage):
+            print(
+                f"[{agent_name}] result subtype={message.subtype!r} "
+                f"is_error={message.is_error} turns={message.num_turns}",
+                flush=True,
+            )
+            if message.structured_output:
+                structured = message.structured_output
+            if message.is_error:
+                raise RuntimeError(
+                    f"[{agent_name}] agent error: subtype={message.subtype} "
+                    f"result={message.result}"
+                )
+        elif isinstance(message, SystemMessage):
+            print(f"[{agent_name}] system subtype={message.subtype!r}", flush=True)
+
+    print(
+        f"[{agent_name}] done. turns={turn} structured_output={bool(structured)}",
+        flush=True,
+    )
+    return structured
+
+
+async def _detector_agent(
+    vulnerability_class: str,
+    request: SecuritySweepRequest,
+    snippets: list[FileSnippet],
+) -> DetectorResult:
+    from claude_agent_sdk import ClaudeAgentOptions
+
+    # snippets are already pre-selected by the coordinator
+    tmpdir = _write_snippets_to_tmpdir(snippets)
+
+    options = ClaudeAgentOptions(
+        system_prompt=build_detector_skill(vulnerability_class),
+        allowed_tools=["Read", "Grep", "Glob"],
+        disallowed_tools=["Edit", "Write", "Bash", "MultiEdit", "NotebookEdit"],
+        permission_mode="bypassPermissions",
+        cwd=tmpdir,
+        max_turns=30,
+        model=request.model,
+        thinking={"type": "enabled", "budget_tokens": 8000},
+        output_format={
+            "type": "json_schema",
+            "schema": {
+                "type": "object",
+                "required": ["notes", "findings"],
+                "properties": {
+                    "notes": {"type": "string"},
+                    "findings": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": [
+                                "vulnerability_class", "severity", "endpoint",
+                                "file_path", "line_start", "line_end", "summary",
+                                "evidence", "exploit_scenario", "confidence",
+                                "recommended_fix",
+                            ],
+                            "properties": {
+                                "vulnerability_class": {"type": "string"},
+                                "severity": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
+                                "endpoint": {"type": "string"},
+                                "file_path": {"type": "string"},
+                                "line_start": {"type": "integer"},
+                                "line_end": {"type": "integer"},
+                                "summary": {"type": "string"},
+                                "evidence": {"type": "string"},
+                                "exploit_scenario": {"type": "string"},
+                                "confidence": {"type": "number"},
+                                "recommended_fix": {"type": "string"},
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    )
+
+    prompt = (
+        f"Analyze this Python codebase for **{vulnerability_class}** vulnerabilities.\n\n"
+        f"Workflow:\n"
+        f"1. Use Glob(\"**/*.py\") to discover all files\n"
+        f"2. Use Grep to search for vulnerability-specific patterns\n"
+        f"3. Use Read to examine suspicious files and trace data flows\n\n"
+        f"Report up to {request.max_findings_per_detector} confirmed, exploitable findings. "
+        f"Return an empty findings array if nothing is found."
+    )
+
+    raw = await _run_agent(f"detector:{vulnerability_class}", prompt, options)
+
+    findings: list[CandidateFinding] = []
+    for idx, f in enumerate(
+        raw.get("findings", [])[: request.max_findings_per_detector], start=1
+    ):
+        findings.append(
+            CandidateFinding.model_validate(
+                {**f, "finding_id": f"{vulnerability_class}-{idx}", "vulnerability_class": vulnerability_class}
+            )
+        )
+
+    return DetectorResult(
+        vulnerability_class=vulnerability_class,
+        notes=raw.get("notes", "Agent produced no structured output"),
+        findings=findings,
+    )
+
+
+async def _manager_agent(
+    finding: CandidateFinding,
+    request: SecuritySweepRequest,
+    snippets: list[FileSnippet],
+) -> ManagerReview:
+    from claude_agent_sdk import ClaudeAgentOptions
+
+    tmpdir = _write_snippets_to_tmpdir(snippets)
+
+    options = ClaudeAgentOptions(
+        system_prompt=MANAGER_SKILL,
+        allowed_tools=["Read", "Grep"],
+        disallowed_tools=["Edit", "Write", "Bash", "MultiEdit", "NotebookEdit"],
+        permission_mode="bypassPermissions",
+        cwd=tmpdir,
+        max_turns=15,
+        model=request.model,
+        thinking={"type": "enabled", "budget_tokens": 8000},
+        output_format={
+            "type": "json_schema",
+            "schema": {
+                "type": "object",
+                "required": ["finding_id", "decision", "rationale", "requested_followups"],
+                "properties": {
+                    "finding_id": {"type": "string"},
+                    "decision": {"type": "string", "enum": ["approved", "rejected", "needs_human"]},
+                    "rationale": {"type": "string"},
+                    "requested_followups": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+        },
+    )
+
+    prompt = (
+        f"Review this vulnerability finding:\n\n"
+        f"```json\n{json.dumps(finding.model_dump(), indent=2)}\n```\n\n"
+        f"The relevant source files are in your working directory. "
+        f"Use Read to examine the vulnerable code and Grep to search for "
+        f"any mitigations (middleware, decorators, authorization checks) "
+        f"that might have been missed by the detector.\n\n"
+        f"Output your review decision as JSON."
+    )
+
+    raw = await _run_agent(f"manager:{finding.finding_id}", prompt, options)
+
+    if not raw:
+        return ManagerReview(
+            finding_id=finding.finding_id,
+            decision="needs_human",
+            rationale="Manager agent produced no structured output",
+            requested_followups=["Manual analyst review required"],
+        )
+
+    raw.setdefault("finding_id", finding.finding_id)
+    review = ManagerReview.model_validate(raw)
+    if review.finding_id != finding.finding_id:
+        review = review.model_copy(update={"finding_id": finding.finding_id})
+    return review
+
+
+async def _validator_agent(
+    finding: CandidateFinding,
+    manager_review: ManagerReview,
+    request: SecuritySweepRequest,
+    snippets: list[FileSnippet],
+) -> ValidationResult:
+    from claude_agent_sdk import ClaudeAgentOptions
+
+    tmpdir = _write_snippets_to_tmpdir(snippets)
+
+    options = ClaudeAgentOptions(
+        system_prompt=VALIDATOR_SKILL,
+        allowed_tools=["Read", "Grep", "Glob"],
+        disallowed_tools=["Edit", "Write", "Bash", "MultiEdit", "NotebookEdit"],
+        permission_mode="bypassPermissions",
+        cwd=tmpdir,
+        max_turns=30,
+        model=request.model,
+        thinking={"type": "enabled", "budget_tokens": 8000},
+        output_format={
+            "type": "json_schema",
+            "schema": {
+                "type": "object",
+                "required": ["finding_id", "status", "rationale", "test_file_path", "test_code", "run_command"],
+                "properties": {
+                    "finding_id": {"type": "string"},
+                    "status": {"type": "string", "enum": ["confirmed", "false_positive", "needs_human"]},
+                    "rationale": {"type": "string"},
+                    "test_file_path": {"type": "string"},
+                    "test_code": {"type": "string"},
+                    "run_command": {"type": "string"},
+                },
+            },
+        },
+    )
+
+    prompt = (
+        f"Write a validation test for this approved finding:\n\n"
+        f"**Finding:**\n```json\n{json.dumps(finding.model_dump(), indent=2)}\n```\n\n"
+        f"**Manager review:**\n```json\n{json.dumps(manager_review.model_dump(), indent=2)}\n```\n\n"
+        f"The relevant source files are in your working directory. "
+        f"Use Read to understand the code structure and Glob to discover existing test files "
+        f"(to match the project's testing patterns).\n\n"
+        f"**IMPORTANT**: Your job is ONLY to WRITE the test code — do NOT edit source files, "
+        f"do NOT apply any fix, and do NOT run any commands. "
+        f"Just read the code, reason about the vulnerability, and produce test code that:\n"
+        f"  - Would FAIL on the current vulnerable code (it calls the buggy code path)\n"
+        f"  - Would PASS after the minimal fix is applied\n\n"
+        f"Default test command: `{request.test_command}`\n\n"
+        f"Output your validation result as JSON."
+    )
+
+    raw = await _run_agent(f"validator:{finding.finding_id}", prompt, options)
+
+    if not raw:
+        return ValidationResult(
+            finding_id=finding.finding_id,
+            status="needs_human",
+            rationale="Validator agent produced no structured output",
+            test_file_path=f"tests/security/test_{finding.finding_id}.py",
+            test_code="",
+            run_command=request.test_command,
+        )
+
+    raw.setdefault("finding_id", finding.finding_id)
+    raw.setdefault("run_command", request.test_command)
+    validation = ValidationResult.model_validate(raw)
+    if validation.finding_id != finding.finding_id:
+        validation = validation.model_copy(update={"finding_id": finding.finding_id})
+    return validation
+
+
+async def _fixer_agent(
+    finding: CandidateFinding,
+    validation: ValidationResult,
+    request: SecuritySweepRequest,
+    snippets: list[FileSnippet],
+) -> FixProposal:
+    from claude_agent_sdk import ClaudeAgentOptions
+
+    tmpdir = _write_snippets_to_tmpdir(snippets)
+
+    options = ClaudeAgentOptions(
+        system_prompt=FIXER_SKILL,
+        allowed_tools=["Read", "Grep"],
+        disallowed_tools=["Edit", "Write", "Bash", "MultiEdit", "NotebookEdit"],
+        permission_mode="bypassPermissions",
+        cwd=tmpdir,
+        max_turns=20,
+        model=request.model,
+        thinking={"type": "enabled", "budget_tokens": 8000},
+        output_format={
+            "type": "json_schema",
+            "schema": {
+                "type": "object",
+                "required": ["finding_id", "status", "patch_diff", "files_touched", "pr_title", "pr_body", "notes"],
+                "properties": {
+                    "finding_id": {"type": "string"},
+                    "status": {"type": "string", "enum": ["generated", "skipped", "failed"]},
+                    "patch_diff": {"type": "string"},
+                    "files_touched": {"type": "array", "items": {"type": "string"}},
+                    "pr_title": {"type": "string"},
+                    "pr_body": {"type": "string"},
+                    "notes": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+        },
+    )
+
+    prompt = (
+        f"Generate a minimal patch for this confirmed vulnerability:\n\n"
+        f"**Finding:**\n```json\n{json.dumps(finding.model_dump(), indent=2)}\n```\n\n"
+        f"**Validation:**\n```json\n{json.dumps(validation.model_dump(), indent=2)}\n```\n\n"
+        f"The vulnerable source files are in your working directory. "
+        f"Use Read to examine the exact code at {finding.file_path} lines "
+        f"{finding.line_start}–{finding.line_end} and any surrounding context.\n\n"
+        f"Keep the diff minimal — only change what is necessary.\n\n"
+        f"Output your patch proposal as JSON."
+    )
+
+    raw = await _run_agent(f"fixer:{finding.finding_id}", prompt, options)
+
+    if not raw:
+        return FixProposal(
+            finding_id=finding.finding_id,
+            status="failed",
+            notes=["Fixer agent produced no structured output"],
+        )
+
+    raw.setdefault("finding_id", finding.finding_id)
+    proposal = FixProposal.model_validate(raw)
+    if proposal.finding_id != finding.finding_id:
+        proposal = proposal.model_copy(update={"finding_id": finding.finding_id})
+    return proposal
+
+
+# ---------------------------------------------------------------------------
+# Tensorlake @functions — synchronous wrappers around the async agents
+# ---------------------------------------------------------------------------
+
+@function(image=security_image, timeout=300)
+def build_code_corpus(request: SecuritySweepRequest) -> list[FileSnippet]:
+    """Clone/scan repo and return all matching file snippets."""
+    if request.repo_url:
+        tmp = tempfile.mkdtemp()
+        clone_cmd = ["git", "clone", "--depth", "1"]
+        if request.repo_branch:
+            clone_cmd += ["--branch", request.repo_branch]
+        clone_cmd += [request.repo_url, tmp]
+
+        safe_url = request.repo_url.split("@")[-1] if "@" in request.repo_url else request.repo_url
+        print(
+            f"[build_code_corpus] Cloning {safe_url}"
+            + (f" (branch: {request.repo_branch})" if request.repo_branch else " (default branch)")
+        )
+
+        try:
+            result = subprocess.run(clone_cmd, check=True, capture_output=True, text=True)
+            if result.stderr:
+                print(f"[build_code_corpus] git clone output: {result.stderr.strip()}")
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr.strip() if exc.stderr else "(no output)"
+            raise RuntimeError(f"Failed to clone repository '{safe_url}': {stderr}") from exc
+
+        repo = Path(tmp)
+    else:
+        repo = _resolve_repo_path(request.repo_path)
+
+    extensions = {
+        ext.lower() if ext.startswith(".") else f".{ext.lower()}"
+        for ext in request.file_extensions
+    }
+
+    snippets: list[FileSnippet] = []
+    for candidate in repo.rglob("*"):
+        if not candidate.is_file():
+            continue
+        if extensions and candidate.suffix.lower() not in extensions:
+            continue
+        relative = candidate.relative_to(repo).as_posix()
+        if not _matches_globs(relative, request.include_globs, request.exclude_globs):
+            continue
+        try:
+            content = candidate.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            content = candidate.read_text(encoding="utf-8", errors="ignore")
+        stripped = content.strip()
+        if not stripped:
+            continue
+        snippets.append(
+            FileSnippet(
+                path=relative,
+                content=stripped[: request.max_chars_per_file],
+                line_count=content.count("\n") + 1,
+            )
+        )
+
+    snippets.sort(key=lambda s: s.path)
+    return snippets
+
+
+@function(
+    image=security_image,
+    secrets=["ANTHROPIC_API_KEY"],
+    retries=Retries(max_retries=2),
+    timeout=900,
+    max_containers=8,
+    warm_containers=1,
+)
+def run_detector(
+    vulnerability_class: str,
+    request: SecuritySweepRequest,
+    snippets: list[FileSnippet],
+) -> DetectorResult:
+    """Detector agent: iteratively explores the codebase with Read/Grep/Glob.
+
+    The agent uses its specialized vulnerability skill prompt to guide its
+    investigation, then calls submit_findings to return structured results.
+    Parallelized: one container per vulnerability class.
+    """
+    _ensure_nonroot()
+    try:
+        return asyncio.run(
+            _detector_agent(vulnerability_class, request, snippets)
+        )
+    except Exception as exc:
+        return DetectorResult(
+            vulnerability_class=vulnerability_class,
+            notes=f"detector_error: {exc}",
+            findings=[],
+        )
+
+
+@function(
+    image=security_image,
+    secrets=["ANTHROPIC_API_KEY"],
+    retries=Retries(max_retries=1),
+    timeout=600,
+    max_containers=12,
+)
+def run_manager_review(
+    finding: CandidateFinding,
+    request: SecuritySweepRequest,
+    snippets: list[FileSnippet],
+) -> ManagerReview:
+    """Manager agent: adversarially reviews each finding, rejecting ~40% as false positives.
+
+    Uses Read/Grep to look for mitigations the detector may have missed (middleware,
+    decorators, authorization checks up the call stack).
+    Parallelized: one container per finding.
+    """
+    _ensure_nonroot()
+    try:
+        return asyncio.run(
+            _manager_agent(finding, request, snippets)
+        )
+    except Exception as exc:
+        return ManagerReview(
+            finding_id=finding.finding_id,
+            decision="needs_human",
+            rationale=f"manager_error: {exc}",
+            requested_followups=["Manual analyst review required"],
+        )
+
+
+@function(
+    image=security_image,
+    secrets=["ANTHROPIC_API_KEY"],
+    retries=Retries(max_retries=1),
+    timeout=600,
+    max_containers=8,
+)
+def run_validator(
+    finding: CandidateFinding,
+    manager_review: ManagerReview,
+    request: SecuritySweepRequest,
+    snippets: list[FileSnippet],
+) -> ValidationResult:
+    """Validator agent: writes an integration test that fails before fix, passes after.
+
+    Uses Glob to discover existing test patterns, then Read to understand the
+    vulnerable code path, then writes a targeted test.
+    Parallelized: one container per approved finding.
+    """
+    _ensure_nonroot()
+    try:
+        return asyncio.run(
+            _validator_agent(finding, manager_review, request, snippets)
+        )
+    except Exception as exc:
+        return ValidationResult(
+            finding_id=finding.finding_id,
+            status="needs_human",
+            rationale=f"validator_error: {exc}",
+            test_file_path=f"tests/security/test_{finding.finding_id}.py",
+            test_code="",
+            run_command=request.test_command,
+        )
+
+
+@function(
+    image=security_image,
+    secrets=["ANTHROPIC_API_KEY"],
+    retries=Retries(max_retries=1),
+    timeout=900,
+    max_containers=4,
+)
+def run_fixer(
+    finding: CandidateFinding,
+    validation: ValidationResult,
+    request: SecuritySweepRequest,
+    snippets: list[FileSnippet],
+) -> FixProposal:
+    """Fixer agent: generates a minimal patch using test-driven development.
+
+    Reads the vulnerable code, writes a diff that makes the validator test pass,
+    and produces a PR title + body for human review.
+    Parallelized: one container per confirmed finding.
+    """
+    _ensure_nonroot()
+    if validation.status != "confirmed":
+        return FixProposal(
+            finding_id=finding.finding_id,
+            status="skipped",
+            notes=["Fix generation skipped because validator did not confirm the finding."],
+        )
+    try:
+        return asyncio.run(
+            _fixer_agent(finding, validation, request, snippets)
+        )
+    except Exception as exc:
+        return FixProposal(
+            finding_id=finding.finding_id,
+            status="failed",
+            notes=[f"fixer_error: {exc}"],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Coordinator — orchestrates all stages with Tensorlake parallel futures
+# ---------------------------------------------------------------------------
 
 def _build_summary_markdown(
     request: SecuritySweepRequest,
@@ -183,18 +725,15 @@ def _build_summary_markdown(
     lifecycles: list[FindingLifecycle],
 ) -> str:
     approved = sum(
-        1
-        for item in lifecycles
+        1 for item in lifecycles
         if item.manager_review and item.manager_review.decision == "approved"
     )
     confirmed = sum(
-        1
-        for item in lifecycles
+        1 for item in lifecycles
         if item.validation and item.validation.status == "confirmed"
     )
     fixes = sum(
-        1
-        for item in lifecycles
+        1 for item in lifecycles
         if item.fix and item.fix.status == "generated"
     )
 
@@ -212,13 +751,10 @@ def _build_summary_markdown(
         "## Detector Notes",
     ]
 
-    for detector in detector_results:
-        lines.append(
-            f"- `{detector.vulnerability_class}`: {len(detector.findings)} findings. {detector.notes}"
-        )
+    for dr in detector_results:
+        lines.append(f"- `{dr.vulnerability_class}`: {len(dr.findings)} findings. {dr.notes}")
 
-    lines.append("")
-    lines.append("## Finding Details")
+    lines += ["", "## Finding Details"]
 
     if not lifecycles:
         lines.append("No findings were detected.")
@@ -234,338 +770,75 @@ def _build_summary_markdown(
     )
 
     for item in ordered:
-        candidate = item.candidate
-        lines.extend(
-            [
-                "",
-                "---",
-                "",
-                f"### {candidate.finding_id} — [{candidate.severity.upper()}] `{candidate.vulnerability_class}`",
-                "",
-                f"**Location:** `{candidate.file_path}:{candidate.line_start}` &nbsp;|&nbsp; "
-                f"**Endpoint:** `{candidate.endpoint}` &nbsp;|&nbsp; "
-                f"**Confidence:** `{candidate.confidence:.0%}`",
-                "",
-                f"**Summary:** {candidate.summary}",
-                "",
-                "**Evidence:**",
-                "```",
-                candidate.evidence.strip(),
-                "```",
-                "",
-                f"**Exploit scenario:** {candidate.exploit_scenario}",
-                "",
-                f"**Recommended fix:** {candidate.recommended_fix}",
-            ]
-        )
+        c = item.candidate
+        lines.extend([
+            "", "---", "",
+            f"### {c.finding_id} — [{c.severity.upper()}] `{c.vulnerability_class}`",
+            "",
+            f"**Location:** `{c.file_path}:{c.line_start}` &nbsp;|&nbsp; "
+            f"**Endpoint:** `{c.endpoint}` &nbsp;|&nbsp; "
+            f"**Confidence:** `{c.confidence:.0%}`",
+            "", f"**Summary:** {c.summary}", "",
+            "**Evidence:**", "```", c.evidence.strip(), "```", "",
+            f"**Exploit scenario:** {c.exploit_scenario}", "",
+            f"**Recommended fix:** {c.recommended_fix}",
+        ])
 
         if item.manager_review:
-            lines.extend(
-                [
-                    "",
-                    f"**Manager review:** `{item.manager_review.decision}` — {item.manager_review.rationale}",
-                ]
-            )
-
+            lines += [
+                "",
+                f"**Manager review:** `{item.manager_review.decision}` — {item.manager_review.rationale}",
+            ]
         if item.validation:
-            lines.extend(
-                [
-                    "",
-                    f"**Validation:** `{item.validation.status}` — {item.validation.rationale}",
-                ]
-            )
+            lines += [
+                "",
+                f"**Validation:** `{item.validation.status}` — {item.validation.rationale}",
+            ]
             if item.validation.test_file_path:
                 lines.append(f"  - Suggested test file: `{item.validation.test_file_path}`")
-
         if item.fix:
-            lines.extend(["", f"**Fix proposal:** `{item.fix.status}`"])
+            lines += ["", f"**Fix proposal:** `{item.fix.status}`"]
             if item.fix.pr_title:
-                lines.extend(["", f"**PR title:** {item.fix.pr_title}"])
+                lines += ["", f"**PR title:** {item.fix.pr_title}"]
             if item.fix.files_touched:
-                lines.extend(["", f"**Files touched:** {', '.join(f'`{f}`' for f in item.fix.files_touched)}"])
+                lines += ["", f"**Files touched:** {', '.join(f'`{f}`' for f in item.fix.files_touched)}"]
             if item.fix.pr_body:
-                lines.extend(["", "**PR description:**", "", item.fix.pr_body])
+                lines += ["", "**PR description:**", "", item.fix.pr_body]
             if item.fix.patch_diff:
-                lines.extend(["", "**Patch diff:**", "```diff", item.fix.patch_diff.strip(), "```"])
+                lines += ["", "**Patch diff:**", "```diff", item.fix.patch_diff.strip(), "```"]
             if item.fix.notes:
-                lines.extend(["", "**Fixer notes:**"])
+                lines += ["", "**Fixer notes:**"]
                 for note in item.fix.notes:
                     lines.append(f"- {note}")
 
     return "\n".join(lines)
 
 
-@function(image=security_image, timeout=300)
-def build_code_corpus(request: SecuritySweepRequest) -> list[FileSnippet]:
-    if request.repo_url:
-        tmp = tempfile.mkdtemp()
-        clone_cmd = ["git", "clone", "--depth", "1"]
-        if request.repo_branch:
-            clone_cmd += ["--branch", request.repo_branch]
-        clone_cmd += [request.repo_url, tmp]
-
-        safe_url = request.repo_url.split("@")[-1] if "@" in request.repo_url else request.repo_url
-        print(f"[build_code_corpus] Cloning {safe_url}" + (f" (branch: {request.repo_branch})" if request.repo_branch else " (default branch)"))
-
-        try:
-            result = subprocess.run(clone_cmd, check=True, capture_output=True, text=True)
-            if result.stderr:
-                print(f"[build_code_corpus] git clone output: {result.stderr.strip()}")
-        except subprocess.CalledProcessError as exc:
-            stderr = exc.stderr.strip() if exc.stderr else "(no output)"
-            print(f"[build_code_corpus] ERROR: git clone failed for {safe_url}")
-            print(f"[build_code_corpus] git stderr: {stderr}")
-            raise RuntimeError(
-                f"Failed to clone repository '{safe_url}': {stderr}"
-            ) from exc
-
-        repo = Path(tmp)
-    else:
-        repo = _resolve_repo_path(request.repo_path)
-    extensions = {
-        extension.lower() if extension.startswith(".") else f".{extension.lower()}"
-        for extension in request.file_extensions
-    }
-
-    snippets: list[FileSnippet] = []
-
-    for candidate in repo.rglob("*"):
-        if not candidate.is_file():
-            continue
-
-        if extensions and candidate.suffix.lower() not in extensions:
-            continue
-
-        relative = candidate.relative_to(repo).as_posix()
-        if not _matches_globs(relative, request.include_globs, request.exclude_globs):
-            continue
-
-        try:
-            content = candidate.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            content = candidate.read_text(encoding="utf-8", errors="ignore")
-
-        stripped = content.strip()
-        if not stripped:
-            continue
-
-        snippets.append(
-            FileSnippet(
-                path=relative,
-                content=stripped[: request.max_chars_per_file],
-                line_count=content.count("\n") + 1,
-            )
-        )
-
-    snippets.sort(key=lambda snippet: snippet.path)
-    return snippets
-
-
-@function(
-    image=security_image,
-    secrets=["OPENAI_API_KEY"],
-    retries=Retries(max_retries=2),
-    timeout=900,
-    max_containers=8,
-    warm_containers=1,
-)
-def run_detector(
-    vulnerability_class: str,
-    request: SecuritySweepRequest,
-    snippets: list[FileSnippet],
-) -> DetectorResult:
-    selected = _select_snippets_for_detector(
-        snippets=snippets,
-        vulnerability_class=vulnerability_class,
-        limit=request.max_files_per_detector,
-    )
-
-    payload = {
-        "vulnerability_class": vulnerability_class,
-        "max_findings": request.max_findings_per_detector,
-        "snippets": [snippet.model_dump() for snippet in selected],
-    }
-
-    try:
-        raw = _call_llm_json(
-            system_prompt=build_detector_prompt(vulnerability_class),
-            payload=payload,
-            model=request.model,
-        )
-        parsed = DetectorResult.model_validate(raw)
-    except Exception as exc:
-        return DetectorResult(
-            vulnerability_class=vulnerability_class,
-            notes=f"detector_error: {exc}",
-            findings=[],
-        )
-
-    findings: list[CandidateFinding] = []
-    for idx, finding in enumerate(parsed.findings[: request.max_findings_per_detector], start=1):
-        finding_id = finding.finding_id or f"{vulnerability_class}-{idx}"
-        findings.append(
-            finding.model_copy(
-                update={
-                    "finding_id": finding_id,
-                    "vulnerability_class": vulnerability_class,
-                }
-            )
-        )
-
-    return DetectorResult(
-        vulnerability_class=vulnerability_class,
-        notes=parsed.notes,
-        findings=findings,
-    )
-
-
-@function(
-    image=security_image,
-    secrets=["OPENAI_API_KEY"],
-    retries=Retries(max_retries=1),
-    timeout=600,
-    max_containers=12,
-)
-def run_manager_review(
-    finding: CandidateFinding,
-    request: SecuritySweepRequest,
-    snippets: list[FileSnippet],
-) -> ManagerReview:
-    payload = {
-        "finding": finding.model_dump(),
-        "relevant_snippets": [
-            snippet.model_dump()
-            for snippet in _snippets_for_finding(finding=finding, snippets=snippets)
-        ],
-    }
-
-    try:
-        raw = _call_llm_json(
-            system_prompt=MANAGER_PROMPT,
-            payload=payload,
-            model=request.model,
-        )
-        review = ManagerReview.model_validate(raw)
-        if review.finding_id != finding.finding_id:
-            review = review.model_copy(update={"finding_id": finding.finding_id})
-        return review
-    except Exception as exc:
-        return ManagerReview(
-            finding_id=finding.finding_id,
-            decision="needs_human",
-            rationale=f"manager_error: {exc}",
-            requested_followups=["Manual analyst review required"],
-        )
-
-
-@function(
-    image=security_image,
-    secrets=["OPENAI_API_KEY"],
-    retries=Retries(max_retries=1),
-    timeout=600,
-    max_containers=8,
-)
-def run_validator(
-    finding: CandidateFinding,
-    manager_review: ManagerReview,
-    request: SecuritySweepRequest,
-    snippets: list[FileSnippet],
-) -> ValidationResult:
-    payload = {
-        "finding": finding.model_dump(),
-        "manager_review": manager_review.model_dump(),
-        "relevant_snippets": [
-            snippet.model_dump()
-            for snippet in _snippets_for_finding(finding=finding, snippets=snippets)
-        ],
-        "default_test_command": request.test_command,
-    }
-
-    try:
-        raw = _call_llm_json(
-            system_prompt=VALIDATOR_PROMPT,
-            payload=payload,
-            model=request.model,
-        )
-        validation = ValidationResult.model_validate(raw)
-        if validation.finding_id != finding.finding_id:
-            validation = validation.model_copy(update={"finding_id": finding.finding_id})
-        return validation
-    except Exception as exc:
-        return ValidationResult(
-            finding_id=finding.finding_id,
-            status="needs_human",
-            rationale=f"validator_error: {exc}",
-            test_file_path=f"tests/security/test_{finding.finding_id}.py",
-            test_code="",
-            run_command=request.test_command,
-        )
-
-
-@function(
-    image=security_image,
-    secrets=["OPENAI_API_KEY"],
-    retries=Retries(max_retries=1),
-    timeout=900,
-    max_containers=4,
-)
-def run_fixer(
-    finding: CandidateFinding,
-    validation: ValidationResult,
-    request: SecuritySweepRequest,
-    snippets: list[FileSnippet],
-) -> FixProposal:
-    if validation.status != "confirmed":
-        return FixProposal(
-            finding_id=finding.finding_id,
-            status="skipped",
-            notes=["Fix generation skipped because validator did not confirm the finding."],
-        )
-
-    payload = {
-        "finding": finding.model_dump(),
-        "validation": validation.model_dump(),
-        "relevant_snippets": [
-            snippet.model_dump()
-            for snippet in _snippets_for_finding(finding=finding, snippets=snippets)
-        ],
-    }
-
-    try:
-        raw = _call_llm_json(
-            system_prompt=FIXER_PROMPT,
-            payload=payload,
-            model=request.model,
-        )
-        proposal = FixProposal.model_validate(raw)
-        if proposal.finding_id != finding.finding_id:
-            proposal = proposal.model_copy(update={"finding_id": finding.finding_id})
-        return proposal
-    except Exception as exc:
-        return FixProposal(
-            finding_id=finding.finding_id,
-            status="failed",
-            notes=[f"fixer_error: {exc}"],
-        )
-
-
 @application(
     tags={
-        "pattern": "detector-manager-validator-fixer",
+        "pattern": "coordinator-detector-manager-validator-fixer",
         "domain": "security",
         "inspired_by": "ramp-100-vulns-blog",
+        "agents": "claude-agent-sdk-multi-turn",
     },
     retries=Retries(max_retries=1),
 )
-@function(image=security_image, secrets=["OPENAI_API_KEY"], timeout=3600)
+@function(image=security_image, secrets=["ANTHROPIC_API_KEY"], timeout=3600)
 def security_autopatch(request: SecuritySweepRequest) -> SecuritySweepReport:
+    """Coordinator: orchestrates the full 5-stage security sweep pipeline.
+
+    Uses Tensorlake futures for parallel fan-out at every stage.
+    Each sub-agent is a multi-turn Claude Agent SDK session that can
+    iteratively explore the codebase before reporting results.
+    """
     ctx = RequestContext.get()
 
+    # ── Stage 1: Corpus ────────────────────────────────────────────────────
     ctx.progress.update(1, 6, "Collecting code corpus", {"repo_path": request.repo_path})
     snippets = build_code_corpus(request)
 
     if not snippets:
-        empty_report = SecuritySweepReport(
+        return SecuritySweepReport(
             repo_path=request.repo_url or request.repo_path,
             repo_branch=request.repo_branch,
             files_scanned=0,
@@ -578,47 +851,53 @@ def security_autopatch(request: SecuritySweepRequest) -> SecuritySweepReport:
             findings=[],
             summary_markdown="# Security Autopatch Sweep\n\nNo matching files were found for scanning.",
         )
-        return empty_report
 
+    # ── Stage 2: Detector agents (parallel) ───────────────────────────────
     ctx.progress.update(
-        2,
-        6,
-        f"Running detector agents ({len(request.vulnerability_classes)})",
+        2, 6,
+        f"Running {len(request.vulnerability_classes)} detector agents in parallel",
         {"files_scanned": str(len(snippets))},
     )
 
     detector_futures: list[Future] = [
-        run_detector.awaitable(vulnerability_class, request, snippets).run()
-        for vulnerability_class in request.vulnerability_classes
+        run_detector.awaitable(vuln_class, request, snippets).run()
+        for vuln_class in request.vulnerability_classes
     ]
     Future.wait(detector_futures, return_when=RETURN_WHEN.ALL_COMPLETED)
 
     detector_results: list[DetectorResult] = []
     for idx, future in enumerate(detector_futures):
-        vulnerability_class = request.vulnerability_classes[idx]
+        vuln_class = request.vulnerability_classes[idx]
         try:
             detector_results.append(future.result())
         except Exception as exc:
             detector_results.append(
                 DetectorResult(
-                    vulnerability_class=vulnerability_class,
+                    vulnerability_class=vuln_class,
                     notes=f"detector_future_error: {exc}",
                     findings=[],
                 )
             )
 
-    candidates = [finding for result in detector_results for finding in result.findings]
+    candidates = [f for result in detector_results for f in result.findings]
     lifecycle_by_id: dict[str, FindingLifecycle] = {
-        finding.finding_id: FindingLifecycle(candidate=finding) for finding in candidates
+        f.finding_id: FindingLifecycle(candidate=f) for f in candidates
     }
-
     approved_findings: list[CandidateFinding] = []
 
+    # ── Stage 3: Manager agents (parallel per finding) ─────────────────────
     if candidates:
-        ctx.progress.update(3, 6, f"Manager triage for {len(candidates)} findings", {})
+        ctx.progress.update(3, 6, f"Manager triage: {len(candidates)} findings", {})
+
         manager_futures: dict[str, Future] = {
-            finding.finding_id: run_manager_review.awaitable(finding, request, snippets).run()
-            for finding in candidates
+            f.finding_id: run_manager_review.awaitable(
+                f,
+                request,
+                # Pre-filter to the handful of files relevant to this finding
+                # so each container receives ~50KB instead of the full corpus.
+                _snippets_for_finding(f, snippets),
+            ).run()
+            for f in candidates
         }
         Future.wait(manager_futures.values(), return_when=RETURN_WHEN.ALL_COMPLETED)
 
@@ -632,7 +911,6 @@ def security_autopatch(request: SecuritySweepRequest) -> SecuritySweepReport:
                     rationale=f"manager_future_error: {exc}",
                     requested_followups=["Manual analyst review required"],
                 )
-
             lifecycle = lifecycle_by_id[finding_id]
             lifecycle.manager_review = review
             if review.decision == "approved":
@@ -640,24 +918,19 @@ def security_autopatch(request: SecuritySweepRequest) -> SecuritySweepReport:
 
     confirmed_findings: list[CandidateFinding] = []
 
+    # ── Stage 4: Validator agents (parallel per approved finding) ──────────
     if request.run_validation and approved_findings:
         ctx.progress.update(
-            4,
-            6,
-            f"Validator stage for {len(approved_findings)} approved findings",
-            {},
+            4, 6, f"Validator stage: {len(approved_findings)} approved findings", {}
         )
 
         validator_futures: dict[str, Future] = {}
         for finding in approved_findings:
-            manager_review = lifecycle_by_id[finding.finding_id].manager_review
-            if manager_review is None:
+            mgr = lifecycle_by_id[finding.finding_id].manager_review
+            if mgr is None:
                 continue
             validator_futures[finding.finding_id] = run_validator.awaitable(
-                finding,
-                manager_review,
-                request,
-                snippets,
+                finding, mgr, request, _snippets_for_finding(finding, snippets)
             ).run()
 
         Future.wait(validator_futures.values(), return_when=RETURN_WHEN.ALL_COMPLETED)
@@ -674,7 +947,6 @@ def security_autopatch(request: SecuritySweepRequest) -> SecuritySweepReport:
                     test_code="",
                     run_command=request.test_command,
                 )
-
             lifecycle = lifecycle_by_id[finding_id]
             lifecycle.validation = validation
             if validation.status == "confirmed":
@@ -691,24 +963,19 @@ def security_autopatch(request: SecuritySweepRequest) -> SecuritySweepReport:
 
     fixes_generated = 0
 
+    # ── Stage 5: Fixer agents (parallel per confirmed finding) ─────────────
     if request.generate_fixes and confirmed_findings:
         ctx.progress.update(
-            5,
-            6,
-            f"Fixer stage for {len(confirmed_findings)} confirmed findings",
-            {},
+            5, 6, f"Fixer stage: {len(confirmed_findings)} confirmed findings", {}
         )
 
         fixer_futures: dict[str, Future] = {}
         for finding in confirmed_findings:
-            validation = lifecycle_by_id[finding.finding_id].validation
-            if validation is None:
+            val = lifecycle_by_id[finding.finding_id].validation
+            if val is None:
                 continue
             fixer_futures[finding.finding_id] = run_fixer.awaitable(
-                finding,
-                validation,
-                request,
-                snippets,
+                finding, val, request, _snippets_for_finding(finding, snippets)
             ).run()
 
         Future.wait(fixer_futures.values(), return_when=RETURN_WHEN.ALL_COMPLETED)
@@ -722,7 +989,6 @@ def security_autopatch(request: SecuritySweepRequest) -> SecuritySweepReport:
                     status="failed",
                     notes=[f"fixer_future_error: {exc}"],
                 )
-
             lifecycle_by_id[finding_id].fix = proposal
             if proposal.status == "generated":
                 fixes_generated += 1
@@ -735,23 +1001,21 @@ def security_autopatch(request: SecuritySweepRequest) -> SecuritySweepReport:
                 notes=["Fix generation disabled by request configuration"],
             )
 
+    # ── Stage 6: Compile report ────────────────────────────────────────────
     lifecycle_items = list(lifecycle_by_id.values())
     summary = _build_summary_markdown(request, detector_results, lifecycle_items)
 
     approved_count = sum(
-        1
-        for item in lifecycle_items
+        1 for item in lifecycle_items
         if item.manager_review and item.manager_review.decision == "approved"
     )
     confirmed_count = sum(
-        1
-        for item in lifecycle_items
+        1 for item in lifecycle_items
         if item.validation and item.validation.status == "confirmed"
     )
 
     ctx.progress.update(
-        6,
-        6,
+        6, 6,
         "Security sweep complete",
         {
             "detected": str(len(candidates)),
