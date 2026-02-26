@@ -48,9 +48,7 @@ from models import (
 )
 from prompts import (
     FIXER_SKILL,
-    KEYWORDS_BY_CLASS,
     MANAGER_SKILL,
-    ROUTE_HINTS,
     VALIDATOR_SKILL,
     build_detector_skill,
 )
@@ -129,40 +127,14 @@ def _matches_globs(path: str, include_globs: list[str], exclude_globs: list[str]
     return not any(_match_glob(path, p) for p in exclude_globs)
 
 
-def _score_snippet(snippet: FileSnippet, vulnerability_class: str) -> int:
-    keywords = KEYWORDS_BY_CLASS.get(vulnerability_class, [])
-    content = snippet.content.lower()
-    path = snippet.path.lower()
-    score = sum(content.count(kw.lower()) * 2 for kw in keywords)
-    score += sum(2 for hint in ROUTE_HINTS if hint in content)
-    if any(token in path for token in ("route", "api", "handler", "controller", "endpoint")):
-        score += 2
-    return score
-
-
-def _select_snippets_for_detector(
-    snippets: list[FileSnippet], vulnerability_class: str, limit: int
-) -> list[FileSnippet]:
-    ranked = sorted(
-        snippets,
-        key=lambda s: (_score_snippet(s, vulnerability_class), s.path),
-        reverse=True,
-    )
-    selected = ranked[:limit]
-    if not selected:
-        return []
-    if _score_snippet(selected[0], vulnerability_class) == 0:
-        return sorted(snippets, key=lambda s: s.path)[:limit]
-    return selected
-
-
 def _snippets_for_finding(
     finding: CandidateFinding, snippets: list[FileSnippet], limit: int = 6
 ) -> list[FileSnippet]:
+    """Return the file containing the finding plus a few nearby files for context."""
     exact = [s for s in snippets if s.path == finding.file_path]
     if exact:
         return exact[:limit]
-    return _select_snippets_for_detector(snippets, finding.vulnerability_class, limit)
+    return sorted(snippets, key=lambda s: s.path)[:limit]
 
 
 def _severity_rank(severity: str) -> int:
@@ -214,6 +186,7 @@ async def _run_agent(
         ResultMessage,
         SystemMessage,
         TextBlock,
+        ThinkingBlock,
         ToolUseBlock,
     )
 
@@ -228,7 +201,10 @@ async def _run_agent(
         if isinstance(message, AssistantMessage):
             turn += 1
             for block in message.content:
-                if isinstance(block, ToolUseBlock):
+                if isinstance(block, ThinkingBlock):
+                    lines = block.thinking.replace("\n", "\n    ")
+                    print(f"[{agent_name}] turn={turn} THINKING:\n    {lines}", flush=True)
+                elif isinstance(block, ToolUseBlock):
                     print(f"[{agent_name}] turn={turn} tool={block.name}", flush=True)
                 elif isinstance(block, TextBlock):
                     preview = block.text[:200].replace("\n", " ")
@@ -274,6 +250,7 @@ async def _detector_agent(
         cwd=tmpdir,
         max_turns=30,
         model=request.model,
+        thinking={"type": "enabled", "budget_tokens": 8000},
         output_format={
             "type": "json_schema",
             "schema": {
@@ -357,6 +334,7 @@ async def _manager_agent(
         cwd=tmpdir,
         max_turns=15,
         model=request.model,
+        thinking={"type": "enabled", "budget_tokens": 8000},
         output_format={
             "type": "json_schema",
             "schema": {
@@ -417,6 +395,7 @@ async def _validator_agent(
         cwd=tmpdir,
         max_turns=30,
         model=request.model,
+        thinking={"type": "enabled", "budget_tokens": 8000},
         output_format={
             "type": "json_schema",
             "schema": {
@@ -488,6 +467,7 @@ async def _fixer_agent(
         cwd=tmpdir,
         max_turns=20,
         model=request.model,
+        thinking={"type": "enabled", "budget_tokens": 8000},
         output_format={
             "type": "json_schema",
             "schema": {
@@ -880,14 +860,7 @@ def security_autopatch(request: SecuritySweepRequest) -> SecuritySweepReport:
     )
 
     detector_futures: list[Future] = [
-        run_detector.awaitable(
-            vuln_class,
-            request,
-            # Pre-select relevant snippets here so each container receives
-            # only max_files_per_detector files (~160KB) instead of the full
-            # corpus (~7MB for 879 files).
-            _select_snippets_for_detector(snippets, vuln_class, request.max_files_per_detector),
-        ).run()
+        run_detector.awaitable(vuln_class, request, snippets).run()
         for vuln_class in request.vulnerability_classes
     ]
     Future.wait(detector_futures, return_when=RETURN_WHEN.ALL_COMPLETED)
