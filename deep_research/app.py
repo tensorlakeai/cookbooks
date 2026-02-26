@@ -111,7 +111,7 @@ def deep_research(query: str) -> str:
     ctx.progress.update(2, 4, f"Searching the web ({len(plan.searches)} queries)...", {})
     search_futures: list[Future] = []
     for item in plan.searches:
-        future = search_web.awaitable(item.model_dump_json()).run()
+        future = search_web.future(item.model_dump_json()).run()
         search_futures.append(future)
 
     Future.wait(search_futures, return_when=RETURN_WHEN.ALL_COMPLETED)

@@ -287,11 +287,11 @@ def parallel_research(topic: str) -> str:
     """
 
     # Launch all three researcher agents in parallel (non-blocking).
-    # Each .awaitable() call creates an Awaitable; .run() dispatches it
-    # to a separate container and returns a Future immediately.
-    future_renewable = research_renewable_energy.awaitable(topic=topic).run()
-    future_ev = research_ev_technology.awaitable(topic=topic).run()
-    future_carbon = research_carbon_capture.awaitable(topic=topic).run()
+    # Each .future() call creates a Future; .run() starts running it by
+    # dispatching it to a separate container.
+    future_renewable = research_renewable_energy.future(topic=topic).run()
+    future_ev = research_ev_technology.future(topic=topic).run()
+    future_carbon = research_carbon_capture.future(topic=topic).run()
 
     # Wait for all three to complete - true distributed parallelism.
     done, _ = Future.wait(

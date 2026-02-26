@@ -20,7 +20,7 @@ Run [Google Agent Development Kit (ADK)](https://google.github.io/adk-docs/agent
 | `Agent` (LlmAgent) | `@function(image=..., secrets=[...])` wrapping an ADK agent + `InMemoryRunner` |
 | Agent tools | `@function()` decorated Python functions (each gets its own container) |
 | `SequentialAgent` | Orchestrator function calling agent functions in order, passing outputs as inputs |
-| `ParallelAgent` | `func.awaitable(...).run()` to launch futures + `Future.wait()` to collect results |
+| `ParallelAgent` | `func.future(...).run()` to launch futures + `Future.wait()` to collect results |
 | `LoopAgent` | Python `for` loop in the orchestrator calling agent functions iteratively |
 | `BaseAgent` (Custom) | Orchestrator function with arbitrary Python control flow (conditionals, loops, parallel stages) |
 
