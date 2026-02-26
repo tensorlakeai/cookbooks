@@ -18,6 +18,7 @@ import asyncio
 import fnmatch
 import json
 import os
+import pwd
 import subprocess
 import sys
 import tempfile
@@ -70,7 +71,34 @@ security_image = (
     )
     .run("npm install -g @anthropic-ai/claude-code")
     .run("pip install claude-agent-sdk pydantic")
+    # Create a non-root user so Claude Code CLI accepts --dangerously-skip-permissions.
+    # The flag is rejected when the process runs as root (UID 0).
+    .run("useradd -m -s /bin/bash appuser")
 )
+
+
+# ---------------------------------------------------------------------------
+# Privilege helpers
+# ---------------------------------------------------------------------------
+
+def _ensure_nonroot() -> None:
+    """Drop from root to 'appuser' so Claude Code CLI accepts --dangerously-skip-permissions.
+
+    The claude binary refuses the flag when UID == 0.  Each Tensorlake container
+    starts as root, so we permanently drop privileges at the top of every agent
+    @function before spawning the Claude Agent SDK subprocess.
+    """
+    if os.getuid() != 0:
+        return  # already non-root, nothing to do
+    try:
+        pw = pwd.getpwnam("appuser")
+        os.setgroups([])
+        os.setgid(pw.pw_gid)
+        os.setuid(pw.pw_uid)
+        os.environ["HOME"] = pw.pw_dir
+        print("[privilege] Dropped to appuser (uid=%d)" % pw.pw_uid, flush=True)
+    except (KeyError, PermissionError) as exc:
+        print(f"[privilege] WARNING: could not drop to appuser: {exc}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +617,7 @@ def run_detector(
     investigation, then calls submit_findings to return structured results.
     Parallelized: one container per vulnerability class.
     """
+    _ensure_nonroot()
     try:
         return asyncio.run(
             _detector_agent(vulnerability_class, request, snippets)
@@ -619,6 +648,7 @@ def run_manager_review(
     decorators, authorization checks up the call stack).
     Parallelized: one container per finding.
     """
+    _ensure_nonroot()
     try:
         return asyncio.run(
             _manager_agent(finding, request, snippets)
@@ -651,6 +681,7 @@ def run_validator(
     vulnerable code path, then writes a targeted test.
     Parallelized: one container per approved finding.
     """
+    _ensure_nonroot()
     try:
         return asyncio.run(
             _validator_agent(finding, manager_review, request, snippets)
@@ -685,6 +716,7 @@ def run_fixer(
     and produces a PR title + body for human review.
     Parallelized: one container per confirmed finding.
     """
+    _ensure_nonroot()
     if validation.status != "confirmed":
         return FixProposal(
             finding_id=finding.finding_id,
