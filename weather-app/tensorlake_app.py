@@ -15,7 +15,7 @@ weather_agent_image = (
 
 
 @application()
-@function(image=weather_agent_image, secrets=["ANTHROPIC_API_KEY"])
+@function(image=weather_agent_image, secrets=["ANTHROPIC_API_KEY"], min_containers=2)
 def handle_weather_query(query: str) -> str:
     """
     Entry point for the Tensorlake workflow.

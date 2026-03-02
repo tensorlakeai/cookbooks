@@ -28,7 +28,7 @@ def run_agent(user_message: str) -> str:
 
     # Use beta.messages for server-side tool features
     response = client.beta.messages.create(
-        model="claude-opus-4-5-20250514",
+        model="claude-opus-4-6",
         max_tokens=2048,
         system=SYSTEM_PROMPT,
         tools=TOOLS,

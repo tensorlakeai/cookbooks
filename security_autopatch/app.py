@@ -1,28 +1,32 @@
-"""Security Autopatch — Coordinator + multi-turn Claude Agent SDK sub-agents.
+"""Security Autopatch — Tensorlake Application
 
-Architecture (mirrors Ramp's "100 vulnerabilities patched with 0 humans"):
-  Coordinator (Tensorlake) orchestrates 5 stages, fanning out in parallel:
-    1. build_code_corpus   — clone/scan repo, return file snippets
-    2. run_detector        — Claude agent iterates with Read/Grep/Glob per vuln class
-    3. run_manager_review  — Claude agent adversarially reviews each finding
-    4. run_validator       — Claude agent writes integration tests per finding
-    5. run_fixer           — Claude agent generates minimal patches
+Replicates the Ramp "100 Vulnerabilities Patched with 0 Humans" architecture
+using the Claude Agent SDK for sub-agents and Tensorlake for orchestration.
 
-Each stage function is a synchronous Tensorlake @function that calls asyncio.run()
-on an async Claude Agent SDK session.  The agents use native filesystem tools
-(Read, Grep, Glob) to explore the code and output_format/structured_output to
-return typed JSON results back to the coordinator without any MCP round-trip.
+Architecture
+────────────
+security_autopatch  (Tensorlake @application — coordinator agent with custom tools)
+├── build_code_corpus   (Tensorlake @function  — pure Python, no LLM)
+├── run_detector        (Tensorlake @function  — Claude Agent SDK sub-agent)
+├── run_manager_review  (Tensorlake @function  — Claude Agent SDK sub-agent)
+├── run_validator       (Tensorlake @function  — Claude Agent SDK sub-agent)
+└── run_fixer           (Tensorlake @function  — Claude Agent SDK sub-agent)
+
+Each sub-agent receives the full repository via Tensorlake's RequestContext
+(backed by S3).  On each container the repo is reconstituted on the local
+filesystem so the Claude agent can explore it with Read, Glob, and Grep tools.
+All inter-agent communication uses plain text.
 """
 
 import asyncio
 import fnmatch
 import json
 import os
-import pwd
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from tensorlake.applications import (
     Future,
@@ -36,17 +40,12 @@ from tensorlake.applications import (
 )
 
 from models import (
-    CandidateFinding,
-    DetectorResult,
-    FileSnippet,
-    FindingLifecycle,
-    FixProposal,
-    ManagerReview,
     SecuritySweepReport,
     SecuritySweepRequest,
-    ValidationResult,
+    FileSnippet,
 )
-from prompts import (
+from skills import (
+    COORDINATOR_SKILL,
     FIXER_SKILL,
     MANAGER_SKILL,
     VALIDATOR_SKILL,
@@ -55,52 +54,29 @@ from prompts import (
 
 
 # ---------------------------------------------------------------------------
-# Docker image
-# The Claude Agent SDK (Python) spawns the Claude Code CLI as a subprocess,
-# so Node.js and @anthropic-ai/claude-code must be installed alongside it.
+# Sandbox flag — Tensorlake containers are sandboxed, so signal this to the
+# Claude Agent SDK / Claude Code runtime.  Without this, running as root
+# (common in Docker) with bypassPermissions mode will be rejected.
+# See: https://github.com/anthropics/claude-code/issues/9184
+# ---------------------------------------------------------------------------
+
+os.environ.setdefault("IS_SANDBOX", "1")
+
+
+# ---------------------------------------------------------------------------
+# Container image
 # ---------------------------------------------------------------------------
 
 security_image = (
-    Image(name="security-autopatch-claude-sdk")
-    .run("apt-get update && apt-get install -y git curl")
-    .run(
-        "curl -fsSL https://deb.nodesource.com/setup_20.x | bash - "
-        "&& apt-get install -y nodejs"
-    )
-    .run("npm install -g @anthropic-ai/claude-code")
+    Image(name="security-autopatch")
+    .run("apt-get update && apt-get install -y git")
     .run("pip install claude-agent-sdk pydantic")
-    # Create a non-root user so Claude Code CLI accepts --dangerously-skip-permissions.
-    # The flag is rejected when the process runs as root (UID 0).
-    .run("useradd -m -s /bin/bash appuser")
+    .run("echo 'IS_SANDBOX=1' >> /etc/environment")
 )
 
 
 # ---------------------------------------------------------------------------
-# Privilege helpers
-# ---------------------------------------------------------------------------
-
-def _ensure_nonroot() -> None:
-    """Drop from root to 'appuser' so Claude Code CLI accepts --dangerously-skip-permissions.
-
-    The claude binary refuses the flag when UID == 0.  Each Tensorlake container
-    starts as root, so we permanently drop privileges at the top of every agent
-    @function before spawning the Claude Agent SDK subprocess.
-    """
-    if os.getuid() != 0:
-        return  # already non-root, nothing to do
-    try:
-        pw = pwd.getpwnam("appuser")
-        os.setgroups([])
-        os.setgid(pw.pw_gid)
-        os.setuid(pw.pw_uid)
-        os.environ["HOME"] = pw.pw_dir
-        print("[privilege] Dropped to appuser (uid=%d)" % pw.pw_uid, flush=True)
-    except (KeyError, PermissionError) as exc:
-        print(f"[privilege] WARNING: could not drop to appuser: {exc}", flush=True)
-
-
-# ---------------------------------------------------------------------------
-# Snippet utilities
+# Pure-Python helpers
 # ---------------------------------------------------------------------------
 
 def _resolve_repo_path(repo_path: str) -> Path:
@@ -127,399 +103,113 @@ def _matches_globs(path: str, include_globs: list[str], exclude_globs: list[str]
     return not any(_match_glob(path, p) for p in exclude_globs)
 
 
-def _snippets_for_finding(
-    finding: CandidateFinding, snippets: list[FileSnippet], limit: int = 6
-) -> list[FileSnippet]:
-    """Return the file containing the finding plus a few nearby files for context."""
-    exact = [s for s in snippets if s.path == finding.file_path]
-    if exact:
-        return exact[:limit]
-    return sorted(snippets, key=lambda s: s.path)[:limit]
+def _reconstitute_repo(snippets: list[FileSnippet]) -> str:
+    """Write FileSnippets to a temp directory, recreating the repo structure.
 
-
-def _severity_rank(severity: str) -> int:
-    return {"critical": 0, "high": 1, "medium": 2, "low": 3}.get(severity.lower(), 4)
-
-
-def _write_snippets_to_tmpdir(snippets: list[FileSnippet]) -> str:
-    """Write file snippets to a temp directory so agents can use Read/Grep/Glob."""
-    tmpdir = tempfile.mkdtemp()
+    Returns the absolute path to the temporary directory.
+    """
+    repo_dir = tempfile.mkdtemp(prefix="repo-")
     for snippet in snippets:
-        file_path = Path(tmpdir) / snippet.path
+        file_path = Path(repo_dir) / snippet.path
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(snippet.content, encoding="utf-8")
-    return tmpdir
+    return repo_dir
 
 
-async def _make_prompt_stream(content: str):
-    """Async generator wrapping a string prompt.
+def _file_listing(snippets: list[FileSnippet]) -> str:
+    """Generate a compact file listing for agent prompts."""
+    return "\n".join(f"  {s.path} ({s.line_count} lines)" for s in snippets)
 
-    Custom in-process MCP tools require streaming (async generator) input format —
-    a plain string prompt does not work when mcp_servers contains SDK servers.
+
+# ---------------------------------------------------------------------------
+# Claude Agent SDK helper — agents communicate in plain text
+# ---------------------------------------------------------------------------
+
+def _run_claude_agent(
+    system_prompt: str,
+    user_prompt: str,
+    max_turns: int = 3,
+    progress_label: str | None = None,
+    progress_step: int | None = None,
+    progress_total: int = 6,
+) -> str:
+    """Run a one-shot Claude Agent SDK agent and return its text result.
+
+    When *progress_label* and *progress_step* are supplied the function
+    emits fine-grained Tensorlake progress updates by inspecting the
+    streamed messages for tool_use blocks (no SDK hooks required).
     """
-    yield {"type": "user", "message": {"role": "user", "content": content}}
+    from claude_agent_sdk import ClaudeAgentOptions, query as claude_query
 
+    result_text = ""
+    collected_blocks: list[str] = []
 
-# ---------------------------------------------------------------------------
-# Async agent runners
-# Each function runs a full multi-turn Claude Agent SDK session:
-#   - Writes relevant snippets to a tmpdir (native filesystem tools work)
-#   - Gives the agent Read / Grep / Glob for iterative code exploration
-#   - Registers a custom MCP tool to capture structured output
-#   - Runs until the agent calls the output tool or hits max_turns
-# ---------------------------------------------------------------------------
+    # Grab ctx once on the Tensorlake worker thread (before asyncio.run).
+    ctx = RequestContext.get() if progress_label else None
 
-async def _run_agent(
-    agent_name: str,
-    prompt: str,
-    options: "ClaudeAgentOptions",
-) -> dict:
-    """Run a single agent turn and return ResultMessage.structured_output.
-
-    Uses output_format on ClaudeAgentOptions so the model is forced to emit
-    structured JSON as its final response — no MCP tool round-trip needed.
-    Returns the parsed dict or {} if the agent failed / produced no output.
-    """
-    from claude_agent_sdk import (
-        query,
-        AssistantMessage,
-        ResultMessage,
-        SystemMessage,
-        TextBlock,
-        ThinkingBlock,
-        ToolUseBlock,
-    )
-
-    def _on_stderr(line: str) -> None:
-        print(f"[{agent_name}][stderr] {line}", flush=True)
-
-    options.stderr = _on_stderr
-
-    structured: dict = {}
-    turn = 0
-    async for message in query(prompt=_make_prompt_stream(prompt), options=options):
-        if isinstance(message, AssistantMessage):
-            turn += 1
-            for block in message.content:
-                if isinstance(block, ThinkingBlock):
-                    lines = block.thinking.replace("\n", "\n    ")
-                    print(f"[{agent_name}] turn={turn} THINKING:\n    {lines}", flush=True)
-                elif isinstance(block, ToolUseBlock):
-                    print(f"[{agent_name}] turn={turn} tool={block.name}", flush=True)
-                elif isinstance(block, TextBlock):
-                    preview = block.text[:200].replace("\n", " ")
-                    print(f"[{agent_name}] turn={turn} text={preview!r}", flush=True)
-        elif isinstance(message, ResultMessage):
-            print(
-                f"[{agent_name}] result subtype={message.subtype!r} "
-                f"is_error={message.is_error} turns={message.num_turns}",
-                flush=True,
+    def _emit_progress(tool_name: str, tool_input: dict) -> None:
+        if ctx is None or progress_step is None:
+            return
+        try:
+            detail = ""
+            if tool_name == "Read" and tool_input.get("file_path"):
+                detail = f" → {tool_input['file_path'].split('/')[-1]}"
+            elif tool_name == "Grep" and tool_input.get("pattern"):
+                detail = f" → /{tool_input['pattern']}/"
+            elif tool_name == "Glob" and tool_input.get("pattern"):
+                detail = f" → {tool_input['pattern']}"
+            ctx.progress.update(
+                progress_step, progress_total,
+                f"{progress_label}: {tool_name}{detail}",
             )
-            if message.structured_output:
-                structured = message.structured_output
-            if message.is_error:
-                raise RuntimeError(
-                    f"[{agent_name}] agent error: subtype={message.subtype} "
-                    f"result={message.result}"
-                )
-        elif isinstance(message, SystemMessage):
-            print(f"[{agent_name}] system subtype={message.subtype!r}", flush=True)
+        except Exception as exc:
+            print(f"[progress] {progress_label}: {type(exc).__name__}: {exc}")
 
-    print(
-        f"[{agent_name}] done. turns={turn} structured_output={bool(structured)}",
-        flush=True,
-    )
-    return structured
+    async def _run():
+        nonlocal result_text
+        async for msg in claude_query(
+            prompt=user_prompt,
+            options=ClaudeAgentOptions(
+                system_prompt=system_prompt,
+                max_turns=max_turns,
+                permission_mode="bypassPermissions",
+            ),
+        ):
+            if hasattr(msg, "content") and msg.content:
+                for block in msg.content:
+                    if hasattr(block, "text"):
+                        collected_blocks.append(block.text)
+                    # Detect tool_use blocks → emit progress
+                    if getattr(block, "type", None) == "tool_use":
+                        _emit_progress(
+                            getattr(block, "name", ""),
+                            getattr(block, "input", {}),
+                        )
+            if hasattr(msg, "result"):
+                result_text = msg.result
 
-
-async def _detector_agent(
-    vulnerability_class: str,
-    request: SecuritySweepRequest,
-    snippets: list[FileSnippet],
-) -> DetectorResult:
-    from claude_agent_sdk import ClaudeAgentOptions
-
-    # snippets are already pre-selected by the coordinator
-    tmpdir = _write_snippets_to_tmpdir(snippets)
-
-    options = ClaudeAgentOptions(
-        system_prompt=build_detector_skill(vulnerability_class),
-        allowed_tools=["Read", "Grep", "Glob"],
-        disallowed_tools=["Edit", "Write", "Bash", "MultiEdit", "NotebookEdit"],
-        permission_mode="bypassPermissions",
-        cwd=tmpdir,
-        max_turns=30,
-        model=request.model,
-        thinking={"type": "enabled", "budget_tokens": 8000},
-        output_format={
-            "type": "json_schema",
-            "schema": {
-                "type": "object",
-                "required": ["notes", "findings"],
-                "properties": {
-                    "notes": {"type": "string"},
-                    "findings": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "required": [
-                                "vulnerability_class", "severity", "endpoint",
-                                "file_path", "line_start", "line_end", "summary",
-                                "evidence", "exploit_scenario", "confidence",
-                                "recommended_fix",
-                            ],
-                            "properties": {
-                                "vulnerability_class": {"type": "string"},
-                                "severity": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
-                                "endpoint": {"type": "string"},
-                                "file_path": {"type": "string"},
-                                "line_start": {"type": "integer"},
-                                "line_end": {"type": "integer"},
-                                "summary": {"type": "string"},
-                                "evidence": {"type": "string"},
-                                "exploit_scenario": {"type": "string"},
-                                "confidence": {"type": "number"},
-                                "recommended_fix": {"type": "string"},
-                            },
-                        },
-                    },
-                },
-            },
-        },
-    )
-
-    prompt = (
-        f"Analyze this Python codebase for **{vulnerability_class}** vulnerabilities.\n\n"
-        f"Workflow:\n"
-        f"1. Use Glob(\"**/*.py\") to discover all files\n"
-        f"2. Use Grep to search for vulnerability-specific patterns\n"
-        f"3. Use Read to examine suspicious files and trace data flows\n\n"
-        f"Report up to {request.max_findings_per_detector} confirmed, exploitable findings. "
-        f"Return an empty findings array if nothing is found."
-    )
-
-    raw = await _run_agent(f"detector:{vulnerability_class}", prompt, options)
-
-    findings: list[CandidateFinding] = []
-    for idx, f in enumerate(
-        raw.get("findings", [])[: request.max_findings_per_detector], start=1
-    ):
-        findings.append(
-            CandidateFinding.model_validate(
-                {**f, "finding_id": f"{vulnerability_class}-{idx}", "vulnerability_class": vulnerability_class}
-            )
-        )
-
-    return DetectorResult(
-        vulnerability_class=vulnerability_class,
-        notes=raw.get("notes", "Agent produced no structured output"),
-        findings=findings,
-    )
+    asyncio.run(_run())
+    return result_text or "\n".join(collected_blocks)
 
 
-async def _manager_agent(
-    finding: CandidateFinding,
-    request: SecuritySweepRequest,
-    snippets: list[FileSnippet],
-) -> ManagerReview:
-    from claude_agent_sdk import ClaudeAgentOptions
-
-    tmpdir = _write_snippets_to_tmpdir(snippets)
-
-    options = ClaudeAgentOptions(
-        system_prompt=MANAGER_SKILL,
-        allowed_tools=["Read", "Grep"],
-        disallowed_tools=["Edit", "Write", "Bash", "MultiEdit", "NotebookEdit"],
-        permission_mode="bypassPermissions",
-        cwd=tmpdir,
-        max_turns=15,
-        model=request.model,
-        thinking={"type": "enabled", "budget_tokens": 8000},
-        output_format={
-            "type": "json_schema",
-            "schema": {
-                "type": "object",
-                "required": ["finding_id", "decision", "rationale", "requested_followups"],
-                "properties": {
-                    "finding_id": {"type": "string"},
-                    "decision": {"type": "string", "enum": ["approved", "rejected", "needs_human"]},
-                    "rationale": {"type": "string"},
-                    "requested_followups": {"type": "array", "items": {"type": "string"}},
-                },
-            },
-        },
-    )
-
-    prompt = (
-        f"Review this vulnerability finding:\n\n"
-        f"```json\n{json.dumps(finding.model_dump(), indent=2)}\n```\n\n"
-        f"The relevant source files are in your working directory. "
-        f"Use Read to examine the vulnerable code and Grep to search for "
-        f"any mitigations (middleware, decorators, authorization checks) "
-        f"that might have been missed by the detector.\n\n"
-        f"Output your review decision as JSON."
-    )
-
-    raw = await _run_agent(f"manager:{finding.finding_id}", prompt, options)
-
-    if not raw:
-        return ManagerReview(
-            finding_id=finding.finding_id,
-            decision="needs_human",
-            rationale="Manager agent produced no structured output",
-            requested_followups=["Manual analyst review required"],
-        )
-
-    raw.setdefault("finding_id", finding.finding_id)
-    review = ManagerReview.model_validate(raw)
-    if review.finding_id != finding.finding_id:
-        review = review.model_copy(update={"finding_id": finding.finding_id})
-    return review
-
-
-async def _validator_agent(
-    finding: CandidateFinding,
-    manager_review: ManagerReview,
-    request: SecuritySweepRequest,
-    snippets: list[FileSnippet],
-) -> ValidationResult:
-    from claude_agent_sdk import ClaudeAgentOptions
-
-    tmpdir = _write_snippets_to_tmpdir(snippets)
-
-    options = ClaudeAgentOptions(
-        system_prompt=VALIDATOR_SKILL,
-        allowed_tools=["Read", "Grep", "Glob"],
-        disallowed_tools=["Edit", "Write", "Bash", "MultiEdit", "NotebookEdit"],
-        permission_mode="bypassPermissions",
-        cwd=tmpdir,
-        max_turns=30,
-        model=request.model,
-        thinking={"type": "enabled", "budget_tokens": 8000},
-        output_format={
-            "type": "json_schema",
-            "schema": {
-                "type": "object",
-                "required": ["finding_id", "status", "rationale", "test_file_path", "test_code", "run_command"],
-                "properties": {
-                    "finding_id": {"type": "string"},
-                    "status": {"type": "string", "enum": ["confirmed", "false_positive", "needs_human"]},
-                    "rationale": {"type": "string"},
-                    "test_file_path": {"type": "string"},
-                    "test_code": {"type": "string"},
-                    "run_command": {"type": "string"},
-                },
-            },
-        },
-    )
-
-    prompt = (
-        f"Write a validation test for this approved finding:\n\n"
-        f"**Finding:**\n```json\n{json.dumps(finding.model_dump(), indent=2)}\n```\n\n"
-        f"**Manager review:**\n```json\n{json.dumps(manager_review.model_dump(), indent=2)}\n```\n\n"
-        f"The relevant source files are in your working directory. "
-        f"Use Read to understand the code structure and Glob to discover existing test files "
-        f"(to match the project's testing patterns).\n\n"
-        f"**IMPORTANT**: Your job is ONLY to WRITE the test code — do NOT edit source files, "
-        f"do NOT apply any fix, and do NOT run any commands. "
-        f"Just read the code, reason about the vulnerability, and produce test code that:\n"
-        f"  - Would FAIL on the current vulnerable code (it calls the buggy code path)\n"
-        f"  - Would PASS after the minimal fix is applied\n\n"
-        f"Default test command: `{request.test_command}`\n\n"
-        f"Output your validation result as JSON."
-    )
-
-    raw = await _run_agent(f"validator:{finding.finding_id}", prompt, options)
-
-    if not raw:
-        return ValidationResult(
-            finding_id=finding.finding_id,
-            status="needs_human",
-            rationale="Validator agent produced no structured output",
-            test_file_path=f"tests/security/test_{finding.finding_id}.py",
-            test_code="",
-            run_command=request.test_command,
-        )
-
-    raw.setdefault("finding_id", finding.finding_id)
-    raw.setdefault("run_command", request.test_command)
-    validation = ValidationResult.model_validate(raw)
-    if validation.finding_id != finding.finding_id:
-        validation = validation.model_copy(update={"finding_id": finding.finding_id})
-    return validation
-
-
-async def _fixer_agent(
-    finding: CandidateFinding,
-    validation: ValidationResult,
-    request: SecuritySweepRequest,
-    snippets: list[FileSnippet],
-) -> FixProposal:
-    from claude_agent_sdk import ClaudeAgentOptions
-
-    tmpdir = _write_snippets_to_tmpdir(snippets)
-
-    options = ClaudeAgentOptions(
-        system_prompt=FIXER_SKILL,
-        allowed_tools=["Read", "Grep"],
-        disallowed_tools=["Edit", "Write", "Bash", "MultiEdit", "NotebookEdit"],
-        permission_mode="bypassPermissions",
-        cwd=tmpdir,
-        max_turns=20,
-        model=request.model,
-        thinking={"type": "enabled", "budget_tokens": 8000},
-        output_format={
-            "type": "json_schema",
-            "schema": {
-                "type": "object",
-                "required": ["finding_id", "status", "patch_diff", "files_touched", "pr_title", "pr_body", "notes"],
-                "properties": {
-                    "finding_id": {"type": "string"},
-                    "status": {"type": "string", "enum": ["generated", "skipped", "failed"]},
-                    "patch_diff": {"type": "string"},
-                    "files_touched": {"type": "array", "items": {"type": "string"}},
-                    "pr_title": {"type": "string"},
-                    "pr_body": {"type": "string"},
-                    "notes": {"type": "array", "items": {"type": "string"}},
-                },
-            },
-        },
-    )
-
-    prompt = (
-        f"Generate a minimal patch for this confirmed vulnerability:\n\n"
-        f"**Finding:**\n```json\n{json.dumps(finding.model_dump(), indent=2)}\n```\n\n"
-        f"**Validation:**\n```json\n{json.dumps(validation.model_dump(), indent=2)}\n```\n\n"
-        f"The vulnerable source files are in your working directory. "
-        f"Use Read to examine the exact code at {finding.file_path} lines "
-        f"{finding.line_start}–{finding.line_end} and any surrounding context.\n\n"
-        f"Keep the diff minimal — only change what is necessary.\n\n"
-        f"Output your patch proposal as JSON."
-    )
-
-    raw = await _run_agent(f"fixer:{finding.finding_id}", prompt, options)
-
-    if not raw:
-        return FixProposal(
-            finding_id=finding.finding_id,
-            status="failed",
-            notes=["Fixer agent produced no structured output"],
-        )
-
-    raw.setdefault("finding_id", finding.finding_id)
-    proposal = FixProposal.model_validate(raw)
-    if proposal.finding_id != finding.finding_id:
-        proposal = proposal.model_copy(update={"finding_id": finding.finding_id})
-    return proposal
+def _get_repo_snippets() -> list[FileSnippet]:
+    """Read the repo snippets from Tensorlake's request context."""
+    ctx = RequestContext.get()
+    return ctx.state.get("repo_snippets")
 
 
 # ---------------------------------------------------------------------------
-# Tensorlake @functions — synchronous wrappers around the async agents
+# Tensorlake function: build_code_corpus (no LLM — pure Python)
 # ---------------------------------------------------------------------------
 
 @function(image=security_image, timeout=300)
-def build_code_corpus(request: SecuritySweepRequest) -> list[FileSnippet]:
-    """Clone/scan repo and return all matching file snippets."""
+def build_code_corpus(request: SecuritySweepRequest) -> int:
+    """Read all matching files and write them to request context.
+
+    Returns the number of files found.  The full list of FileSnippet objects
+    is stored in context under ``repo_snippets`` so every downstream function
+    can access it via ``ctx.request_state.get("repo_snippets")``.
+    """
     if request.repo_url:
         tmp = tempfile.mkdtemp()
         clone_cmd = ["git", "clone", "--depth", "1"]
@@ -528,15 +218,10 @@ def build_code_corpus(request: SecuritySweepRequest) -> list[FileSnippet]:
         clone_cmd += [request.repo_url, tmp]
 
         safe_url = request.repo_url.split("@")[-1] if "@" in request.repo_url else request.repo_url
-        print(
-            f"[build_code_corpus] Cloning {safe_url}"
-            + (f" (branch: {request.repo_branch})" if request.repo_branch else " (default branch)")
-        )
+        print(f"[build_code_corpus] Cloning {safe_url}")
 
         try:
-            result = subprocess.run(clone_cmd, check=True, capture_output=True, text=True)
-            if result.stderr:
-                print(f"[build_code_corpus] git clone output: {result.stderr.strip()}")
+            subprocess.run(clone_cmd, check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as exc:
             stderr = exc.stderr.strip() if exc.stderr else "(no output)"
             raise RuntimeError(f"Failed to clone repository '{safe_url}': {stderr}") from exc
@@ -566,17 +251,24 @@ def build_code_corpus(request: SecuritySweepRequest) -> list[FileSnippet]:
         stripped = content.strip()
         if not stripped:
             continue
-        snippets.append(
-            FileSnippet(
-                path=relative,
-                content=stripped[: request.max_chars_per_file],
-                line_count=content.count("\n") + 1,
-            )
-        )
+        snippets.append(FileSnippet(
+            path=relative,
+            content=stripped[: request.max_chars_per_file],
+            line_count=content.count("\n") + 1,
+        ))
 
     snippets.sort(key=lambda s: s.path)
-    return snippets
 
+    # Write the whole repo into request context (backed by S3)
+    ctx = RequestContext.get()
+    ctx.state.set("repo_snippets", snippets)
+
+    return len(snippets)
+
+
+# ---------------------------------------------------------------------------
+# Tensorlake function: DETECTOR sub-agent
+# ---------------------------------------------------------------------------
 
 @function(
     image=security_image,
@@ -589,26 +281,46 @@ def build_code_corpus(request: SecuritySweepRequest) -> list[FileSnippet]:
 def run_detector(
     vulnerability_class: str,
     request: SecuritySweepRequest,
-    snippets: list[FileSnippet],
-) -> DetectorResult:
-    """Detector agent: iteratively explores the codebase with Read/Grep/Glob.
+) -> str:
+    """Detector sub-agent — explores the repo filesystem and reports findings."""
+    snippets = _get_repo_snippets()
+    repo_dir = _reconstitute_repo(snippets)
+    listing = _file_listing(snippets)
 
-    The agent uses its specialized vulnerability skill prompt to guide its
-    investigation, then calls submit_findings to return structured results.
-    Parallelized: one container per vulnerability class.
-    """
-    _ensure_nonroot()
+    skill = build_detector_skill(vulnerability_class)
+
+    prompt = (
+        f"Analyze the repository for **{vulnerability_class}** vulnerabilities.\n\n"
+        f"The repository has been checked out at: `{repo_dir}`\n"
+        f"It contains {len(snippets)} files:\n{listing}\n\n"
+        "Use your file reading tools to explore the codebase. Start with the "
+        "files most likely to contain this vulnerability class, then follow "
+        "imports, check middleware, configuration, and related files for full "
+        "context.\n\n"
+        f"Report at most {request.max_findings_per_detector} findings.\n\n"
+        "For each finding include:\n"
+        "- A clear title\n"
+        "- Severity (low / medium / high / critical)\n"
+        "- The file path and line numbers\n"
+        "- The vulnerable code evidence\n"
+        "- An exploit scenario\n"
+        "- A recommended fix\n"
+        "- Your confidence (0-100%)\n\n"
+        "If you find no vulnerabilities, say so and explain why."
+    )
+
     try:
-        return asyncio.run(
-            _detector_agent(vulnerability_class, request, snippets)
+        return _run_claude_agent(
+            skill, prompt, max_turns=8,
+            progress_label=f"Detector[{vulnerability_class}]", progress_step=2,
         )
     except Exception as exc:
-        return DetectorResult(
-            vulnerability_class=vulnerability_class,
-            notes=f"detector_error: {exc}",
-            findings=[],
-        )
+        return f"[detector_error for {vulnerability_class}]: {exc}"
 
+
+# ---------------------------------------------------------------------------
+# Tensorlake function: MANAGER sub-agent
+# ---------------------------------------------------------------------------
 
 @function(
     image=security_image,
@@ -618,29 +330,43 @@ def run_detector(
     max_containers=12,
 )
 def run_manager_review(
-    finding: CandidateFinding,
+    vulnerability_class: str,
+    detector_output: str,
     request: SecuritySweepRequest,
-    snippets: list[FileSnippet],
-) -> ManagerReview:
-    """Manager agent: adversarially reviews each finding, rejecting ~40% as false positives.
+) -> str:
+    """Manager sub-agent — adversarial review with full repo access."""
+    snippets = _get_repo_snippets()
+    repo_dir = _reconstitute_repo(snippets)
+    listing = _file_listing(snippets)
 
-    Uses Read/Grep to look for mitigations the detector may have missed (middleware,
-    decorators, authorization checks up the call stack).
-    Parallelized: one container per finding.
-    """
-    _ensure_nonroot()
+    prompt = (
+        "Review the following detector output with an adversarial lens.\n\n"
+        f"## Detector Output\n{detector_output}\n\n"
+        f"## Repository\n"
+        f"The full repository is available at: `{repo_dir}`\n"
+        f"Files ({len(snippets)}):\n{listing}\n\n"
+        "Use your file reading tools to independently verify each finding. "
+        "Read the cited files, check for upstream guards, middleware, "
+        "decorators, and framework protections the detector may have missed.\n\n"
+        "For each finding, state whether you:\n"
+        "- **APPROVE** — the vulnerability is credible and exploitable\n"
+        "- **REJECT** — it is a false positive, with your reasoning\n"
+        "- **NEEDS HUMAN** — you cannot determine; a human analyst should review\n\n"
+        "Give a clear rationale for each decision."
+    )
+
     try:
-        return asyncio.run(
-            _manager_agent(finding, request, snippets)
+        return _run_claude_agent(
+            MANAGER_SKILL, prompt, max_turns=8,
+            progress_label=f"Manager[{vulnerability_class}]", progress_step=3,
         )
     except Exception as exc:
-        return ManagerReview(
-            finding_id=finding.finding_id,
-            decision="needs_human",
-            rationale=f"manager_error: {exc}",
-            requested_followups=["Manual analyst review required"],
-        )
+        return f"[manager_error for {vulnerability_class}]: {exc}"
 
+
+# ---------------------------------------------------------------------------
+# Tensorlake function: VALIDATOR sub-agent
+# ---------------------------------------------------------------------------
 
 @function(
     image=security_image,
@@ -650,32 +376,45 @@ def run_manager_review(
     max_containers=8,
 )
 def run_validator(
-    finding: CandidateFinding,
-    manager_review: ManagerReview,
+    vulnerability_class: str,
+    detector_output: str,
+    manager_output: str,
     request: SecuritySweepRequest,
-    snippets: list[FileSnippet],
-) -> ValidationResult:
-    """Validator agent: writes an integration test that fails before fix, passes after.
+) -> str:
+    """Validator sub-agent — writes tests with full repo access."""
+    snippets = _get_repo_snippets()
+    repo_dir = _reconstitute_repo(snippets)
+    listing = _file_listing(snippets)
 
-    Uses Glob to discover existing test patterns, then Read to understand the
-    vulnerable code path, then writes a targeted test.
-    Parallelized: one container per approved finding.
-    """
-    _ensure_nonroot()
+    prompt = (
+        "Given the following approved vulnerability findings, draft "
+        "integration tests that prove each vulnerability is real.\n\n"
+        f"## Detector Findings\n{detector_output}\n\n"
+        f"## Manager Review\n{manager_output}\n\n"
+        f"## Repository\n"
+        f"The full repository is available at: `{repo_dir}`\n"
+        f"Files ({len(snippets)}):\n{listing}\n\n"
+        "Use your file reading tools to read the vulnerable code and its "
+        "dependencies so you can write accurate, runnable tests.\n\n"
+        f"Default test command: `{request.test_command}`\n\n"
+        "For each approved finding:\n"
+        "1. Write a test that FAILS before the fix and PASSES after.\n"
+        "2. State whether the finding is CONFIRMED, FALSE POSITIVE, or NEEDS HUMAN.\n"
+        "3. Include the full test code and the command to run it.\n"
+    )
+
     try:
-        return asyncio.run(
-            _validator_agent(finding, manager_review, request, snippets)
+        return _run_claude_agent(
+            VALIDATOR_SKILL, prompt, max_turns=8,
+            progress_label=f"Validator[{vulnerability_class}]", progress_step=4,
         )
     except Exception as exc:
-        return ValidationResult(
-            finding_id=finding.finding_id,
-            status="needs_human",
-            rationale=f"validator_error: {exc}",
-            test_file_path=f"tests/security/test_{finding.finding_id}.py",
-            test_code="",
-            run_command=request.test_command,
-        )
+        return f"[validator_error for {vulnerability_class}]: {exc}"
 
+
+# ---------------------------------------------------------------------------
+# Tensorlake function: FIXER sub-agent
+# ---------------------------------------------------------------------------
 
 @function(
     image=security_image,
@@ -685,360 +424,360 @@ def run_validator(
     max_containers=4,
 )
 def run_fixer(
-    finding: CandidateFinding,
-    validation: ValidationResult,
+    vulnerability_class: str,
+    detector_output: str,
+    manager_output: str,
+    validator_output: str,
     request: SecuritySweepRequest,
-    snippets: list[FileSnippet],
-) -> FixProposal:
-    """Fixer agent: generates a minimal patch using test-driven development.
+) -> str:
+    """Fixer sub-agent — generates patches with full repo access."""
+    snippets = _get_repo_snippets()
+    repo_dir = _reconstitute_repo(snippets)
+    listing = _file_listing(snippets)
 
-    Reads the vulnerable code, writes a diff that makes the validator test pass,
-    and produces a PR title + body for human review.
-    Parallelized: one container per confirmed finding.
-    """
-    _ensure_nonroot()
-    if validation.status != "confirmed":
-        return FixProposal(
-            finding_id=finding.finding_id,
-            status="skipped",
-            notes=["Fix generation skipped because validator did not confirm the finding."],
-        )
+    prompt = (
+        "Given the following confirmed vulnerabilities, their validation "
+        "tests, and full repository access, generate minimal patches.\n\n"
+        f"## Detector Findings\n{detector_output}\n\n"
+        f"## Manager Review\n{manager_output}\n\n"
+        f"## Validator Results\n{validator_output}\n\n"
+        f"## Repository\n"
+        f"The full repository is available at: `{repo_dir}`\n"
+        f"Files ({len(snippets)}):\n{listing}\n\n"
+        "Use your file reading tools to read the vulnerable files and their "
+        "context so your patches are accurate and style-consistent.\n\n"
+        "For each confirmed finding:\n"
+        "1. Generate a unified diff patch.\n"
+        "2. Write a PR title and description.\n"
+        "3. List all files touched.\n"
+        "If a finding was not confirmed, skip it and explain why.\n"
+    )
+
     try:
-        return asyncio.run(
-            _fixer_agent(finding, validation, request, snippets)
+        return _run_claude_agent(
+            FIXER_SKILL, prompt, max_turns=8,
+            progress_label=f"Fixer[{vulnerability_class}]", progress_step=5,
         )
     except Exception as exc:
-        return FixProposal(
-            finding_id=finding.finding_id,
-            status="failed",
-            notes=[f"fixer_error: {exc}"],
-        )
+        return f"[fixer_error for {vulnerability_class}]: {exc}"
 
 
 # ---------------------------------------------------------------------------
-# Coordinator — orchestrates all stages with Tensorlake parallel futures
+# Build final markdown report — let Claude assemble it from the raw outputs
 # ---------------------------------------------------------------------------
 
-def _build_summary_markdown(
+def _build_report_markdown(
     request: SecuritySweepRequest,
-    detector_results: list[DetectorResult],
-    lifecycles: list[FindingLifecycle],
+    files_scanned: int,
+    stage_outputs: dict[str, dict[str, str]],
 ) -> str:
-    approved = sum(
-        1 for item in lifecycles
-        if item.manager_review and item.manager_review.decision == "approved"
-    )
-    confirmed = sum(
-        1 for item in lifecycles
-        if item.validation and item.validation.status == "confirmed"
-    )
-    fixes = sum(
-        1 for item in lifecycles
-        if item.fix and item.fix.status == "generated"
-    )
+    """Use Claude to compile a polished markdown report from stage outputs."""
+    raw_sections = []
+    for vc in request.vulnerability_classes:
+        outputs = stage_outputs.get(vc, {})
+        section = f"## Vulnerability Class: {vc}\n\n"
+        for stage_name in ("detector", "manager", "validator", "fixer"):
+            if outputs.get(stage_name):
+                section += f"### {stage_name.title()} Output\n\n{outputs[stage_name]}\n\n"
+        raw_sections.append(section)
 
-    lines = [
-        "# Security Autopatch Sweep",
-        "",
-        f"- Repository: `{request.repo_url or request.repo_path}`",
-        f"- Branch: `{request.repo_branch or 'default'}`",
-        f"- Detectors run: `{len(detector_results)}`",
-        f"- Findings detected: `{len(lifecycles)}`",
-        f"- Findings approved by manager: `{approved}`",
-        f"- Findings confirmed by validator: `{confirmed}`",
-        f"- Fix proposals generated: `{fixes}`",
-        "",
-        "## Detector Notes",
-    ]
+    all_raw = "\n---\n\n".join(raw_sections)
 
-    for dr in detector_results:
-        lines.append(f"- `{dr.vulnerability_class}`: {len(dr.findings)} findings. {dr.notes}")
-
-    lines += ["", "## Finding Details"]
-
-    if not lifecycles:
-        lines.append("No findings were detected.")
-        return "\n".join(lines)
-
-    ordered = sorted(
-        lifecycles,
-        key=lambda item: (
-            _severity_rank(item.candidate.severity),
-            item.candidate.vulnerability_class,
-            item.candidate.finding_id,
-        ),
+    prompt = (
+        "Below are the raw outputs from a multi-stage security vulnerability "
+        "scan.  Compile them into a single, clean Markdown report.\n\n"
+        f"**Repository:** {request.repo_url or request.repo_path}\n"
+        f"**Branch:** {request.repo_branch or 'default'}\n"
+        f"**Files scanned:** {files_scanned}\n\n"
+        "Include:\n"
+        "- An executive summary at the top with counts of findings at each stage\n"
+        "- A section per vulnerability class with detection, review, validation, "
+        "and fix details\n"
+        "- Any patch diffs in fenced code blocks\n"
+        "- A clear call-to-action for human reviewers\n\n"
+        f"Raw stage outputs:\n\n{all_raw}"
     )
 
-    for item in ordered:
-        c = item.candidate
-        lines.extend([
-            "", "---", "",
-            f"### {c.finding_id} — [{c.severity.upper()}] `{c.vulnerability_class}`",
-            "",
-            f"**Location:** `{c.file_path}:{c.line_start}` &nbsp;|&nbsp; "
-            f"**Endpoint:** `{c.endpoint}` &nbsp;|&nbsp; "
-            f"**Confidence:** `{c.confidence:.0%}`",
-            "", f"**Summary:** {c.summary}", "",
-            "**Evidence:**", "```", c.evidence.strip(), "```", "",
-            f"**Exploit scenario:** {c.exploit_scenario}", "",
-            f"**Recommended fix:** {c.recommended_fix}",
-        ])
+    system = (
+        "You are a technical writer compiling a security report. "
+        "Output well-structured Markdown only.  No preamble or commentary."
+    )
 
-        if item.manager_review:
-            lines += [
-                "",
-                f"**Manager review:** `{item.manager_review.decision}` — {item.manager_review.rationale}",
-            ]
-        if item.validation:
-            lines += [
-                "",
-                f"**Validation:** `{item.validation.status}` — {item.validation.rationale}",
-            ]
-            if item.validation.test_file_path:
-                lines.append(f"  - Suggested test file: `{item.validation.test_file_path}`")
-        if item.fix:
-            lines += ["", f"**Fix proposal:** `{item.fix.status}`"]
-            if item.fix.pr_title:
-                lines += ["", f"**PR title:** {item.fix.pr_title}"]
-            if item.fix.files_touched:
-                lines += ["", f"**Files touched:** {', '.join(f'`{f}`' for f in item.fix.files_touched)}"]
-            if item.fix.pr_body:
-                lines += ["", "**PR description:**", "", item.fix.pr_body]
-            if item.fix.patch_diff:
-                lines += ["", "**Patch diff:**", "```diff", item.fix.patch_diff.strip(), "```"]
-            if item.fix.notes:
-                lines += ["", "**Fixer notes:**"]
-                for note in item.fix.notes:
-                    lines.append(f"- {note}")
+    try:
+        return _run_claude_agent(
+            system, prompt,
+            progress_label="Report", progress_step=6,
+        )
+    except Exception:
+        # Fallback: concatenate raw outputs directly
+        return f"# Security Autopatch Sweep\n\n{all_raw}"
 
-    return "\n".join(lines)
 
+# ---------------------------------------------------------------------------
+# Tensorlake application: COORDINATOR AGENT
+# ---------------------------------------------------------------------------
 
 @application(
     tags={
-        "pattern": "coordinator-detector-manager-validator-fixer",
+        "pattern": "detector-manager-validator-fixer",
         "domain": "security",
         "inspired_by": "ramp-100-vulns-blog",
-        "agents": "claude-agent-sdk-multi-turn",
     },
     retries=Retries(max_retries=1),
 )
 @function(image=security_image, secrets=["ANTHROPIC_API_KEY"], timeout=3600)
 def security_autopatch(request: SecuritySweepRequest) -> SecuritySweepReport:
-    """Coordinator: orchestrates the full 5-stage security sweep pipeline.
+    from claude_agent_sdk import (
+        ClaudeAgentOptions,
+        ClaudeSDKClient,
+        create_sdk_mcp_server,
+        tool,
+    )
 
-    Uses Tensorlake futures for parallel fan-out at every stage.
-    Each sub-agent is a multi-turn Claude Agent SDK session that can
-    iteratively explore the codebase before reporting results.
-    """
     ctx = RequestContext.get()
 
-    # ── Stage 1: Corpus ────────────────────────────────────────────────────
-    ctx.progress.update(1, 6, "Collecting code corpus", {"repo_path": request.repo_path})
-    snippets = build_code_corpus(request)
+    # ── Step 1: build code corpus (writes repo into context) ──────────
+    ctx.progress.update(1, 6, "Collecting code corpus", {"repo": request.repo_url or request.repo_path})
+    files_scanned = build_code_corpus(request)
 
-    if not snippets:
+    if not files_scanned:
         return SecuritySweepReport(
             repo_path=request.repo_url or request.repo_path,
             repo_branch=request.repo_branch,
             files_scanned=0,
-            detectors_run=len(request.vulnerability_classes),
-            findings_detected=0,
-            findings_approved=0,
-            findings_confirmed=0,
-            fixes_generated=0,
-            detector_results=[],
-            findings=[],
+            vulnerability_classes=request.vulnerability_classes,
             summary_markdown="# Security Autopatch Sweep\n\nNo matching files were found for scanning.",
+            stage_outputs={},
         )
 
-    # ── Stage 2: Detector agents (parallel) ───────────────────────────────
-    ctx.progress.update(
-        2, 6,
-        f"Running {len(request.vulnerability_classes)} detector agents in parallel",
-        {"files_scanned": str(len(snippets))},
-    )
-
-    detector_futures: list[Future] = [
-        run_detector.future(vuln_class, request, snippets).run()
-        for vuln_class in request.vulnerability_classes
-    ]
-    Future.wait(detector_futures, return_when=RETURN_WHEN.ALL_COMPLETED)
-
-    detector_results: list[DetectorResult] = []
-    for idx, future in enumerate(detector_futures):
-        vuln_class = request.vulnerability_classes[idx]
-        try:
-            detector_results.append(future.result())
-        except Exception as exc:
-            detector_results.append(
-                DetectorResult(
-                    vulnerability_class=vuln_class,
-                    notes=f"detector_future_error: {exc}",
-                    findings=[],
-                )
-            )
-
-    candidates = [f for result in detector_results for f in result.findings]
-    lifecycle_by_id: dict[str, FindingLifecycle] = {
-        f.finding_id: FindingLifecycle(candidate=f) for f in candidates
+    # ── Coordinator mutable state (shared with tool closures) ──────────
+    # stage_outputs[vuln_class] = {detector: str, manager: str, ...}
+    stage_outputs: dict[str, dict[str, str]] = {
+        vc: {} for vc in request.vulnerability_classes
     }
-    approved_findings: list[CandidateFinding] = []
 
-    # ── Stage 3: Manager agents (parallel per finding) ─────────────────────
-    if candidates:
-        ctx.progress.update(3, 6, f"Manager triage: {len(candidates)} findings", {})
+    # ── Custom MCP tools for the coordinator agent ─────────────────────
 
-        manager_futures: dict[str, Future] = {
-            f.finding_id: run_manager_review.future(
-                f,
-                request,
-                # Pre-filter to the handful of files relevant to this finding
-                # so each container receives ~50KB instead of the full corpus.
-                _snippets_for_finding(f, snippets),
-            ).run()
-            for f in candidates
-        }
-        Future.wait(manager_futures.values(), return_when=RETURN_WHEN.ALL_COMPLETED)
-
-        for finding_id, future in manager_futures.items():
-            try:
-                review = future.result()
-            except Exception as exc:
-                review = ManagerReview(
-                    finding_id=finding_id,
-                    decision="needs_human",
-                    rationale=f"manager_future_error: {exc}",
-                    requested_followups=["Manual analyst review required"],
-                )
-            lifecycle = lifecycle_by_id[finding_id]
-            lifecycle.manager_review = review
-            if review.decision == "approved":
-                approved_findings.append(lifecycle.candidate)
-
-    confirmed_findings: list[CandidateFinding] = []
-
-    # ── Stage 4: Validator agents (parallel per approved finding) ──────────
-    if request.run_validation and approved_findings:
-        ctx.progress.update(
-            4, 6, f"Validator stage: {len(approved_findings)} approved findings", {}
-        )
-
-        validator_futures: dict[str, Future] = {}
-        for finding in approved_findings:
-            mgr = lifecycle_by_id[finding.finding_id].manager_review
-            if mgr is None:
-                continue
-            validator_futures[finding.finding_id] = run_validator.future(
-                finding, mgr, request, _snippets_for_finding(finding, snippets)
-            ).run()
-
-        Future.wait(validator_futures.values(), return_when=RETURN_WHEN.ALL_COMPLETED)
-
-        for finding_id, future in validator_futures.items():
-            try:
-                validation = future.result()
-            except Exception as exc:
-                validation = ValidationResult(
-                    finding_id=finding_id,
-                    status="needs_human",
-                    rationale=f"validator_future_error: {exc}",
-                    test_file_path=f"tests/security/test_{finding_id}.py",
-                    test_code="",
-                    run_command=request.test_command,
-                )
-            lifecycle = lifecycle_by_id[finding_id]
-            lifecycle.validation = validation
-            if validation.status == "confirmed":
-                confirmed_findings.append(lifecycle.candidate)
-
-    elif approved_findings:
-        for finding in approved_findings:
-            lifecycle_by_id[finding.finding_id].validation = ValidationResult(
-                finding_id=finding.finding_id,
-                status="needs_human",
-                rationale="Validation stage disabled by request configuration",
-                run_command=request.test_command,
-            )
-
-    fixes_generated = 0
-
-    # ── Stage 5: Fixer agents (parallel per confirmed finding) ─────────────
-    if request.generate_fixes and confirmed_findings:
-        ctx.progress.update(
-            5, 6, f"Fixer stage: {len(confirmed_findings)} confirmed findings", {}
-        )
-
-        fixer_futures: dict[str, Future] = {}
-        for finding in confirmed_findings:
-            val = lifecycle_by_id[finding.finding_id].validation
-            if val is None:
-                continue
-            fixer_futures[finding.finding_id] = run_fixer.future(
-                finding, val, request, _snippets_for_finding(finding, snippets)
-            ).run()
-
-        Future.wait(fixer_futures.values(), return_when=RETURN_WHEN.ALL_COMPLETED)
-
-        for finding_id, future in fixer_futures.items():
-            try:
-                proposal = future.result()
-            except Exception as exc:
-                proposal = FixProposal(
-                    finding_id=finding_id,
-                    status="failed",
-                    notes=[f"fixer_future_error: {exc}"],
-                )
-            lifecycle_by_id[finding_id].fix = proposal
-            if proposal.status == "generated":
-                fixes_generated += 1
-
-    elif confirmed_findings:
-        for finding in confirmed_findings:
-            lifecycle_by_id[finding.finding_id].fix = FixProposal(
-                finding_id=finding.finding_id,
-                status="skipped",
-                notes=["Fix generation disabled by request configuration"],
-            )
-
-    # ── Stage 6: Compile report ────────────────────────────────────────────
-    lifecycle_items = list(lifecycle_by_id.values())
-    summary = _build_summary_markdown(request, detector_results, lifecycle_items)
-
-    approved_count = sum(
-        1 for item in lifecycle_items
-        if item.manager_review and item.manager_review.decision == "approved"
-    )
-    confirmed_count = sum(
-        1 for item in lifecycle_items
-        if item.validation and item.validation.status == "confirmed"
-    )
-
-    ctx.progress.update(
-        6, 6,
-        "Security sweep complete",
+    @tool(
+        "run_detectors",
+        "Run vulnerability detectors in parallel across the codebase. "
+        "Returns a summary of all detected findings as text.",
         {
-            "detected": str(len(candidates)),
-            "approved": str(approved_count),
-            "confirmed": str(confirmed_count),
-            "fixes_generated": str(fixes_generated),
+            "type": "object",
+            "properties": {
+                "vulnerability_classes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of vulnerability classes to scan for",
+                },
+            },
+            "required": ["vulnerability_classes"],
         },
     )
+    async def run_detectors_tool(args: dict[str, Any]) -> dict[str, Any]:
+        vuln_classes = args.get("vulnerability_classes", request.vulnerability_classes)
+        ctx.progress.update(2, 6, f"Running {len(vuln_classes)} detectors")
+
+        futures: dict[str, Future] = {
+            vc: run_detector.awaitable(vc, request).run()
+            for vc in vuln_classes
+        }
+        Future.wait(futures.values(), return_when=RETURN_WHEN.ALL_COMPLETED)
+
+        results_text = []
+        for vc, fut in futures.items():
+            try:
+                output = fut.result()
+            except Exception as exc:
+                output = f"[detector_future_error for {vc}]: {exc}"
+            stage_outputs[vc]["detector"] = output
+            results_text.append(f"## {vc}\n\n{output}")
+
+        combined = "\n\n---\n\n".join(results_text)
+        return {"content": [{"type": "text", "text": f"Detection complete.\n\n{combined}"}]}
+
+    @tool(
+        "run_managers",
+        "Run adversarial manager reviews on detected findings in parallel.",
+        {"type": "object", "properties": {}},
+    )
+    async def run_managers_tool(args: dict[str, Any]) -> dict[str, Any]:
+        vuln_classes = [vc for vc in request.vulnerability_classes if stage_outputs[vc].get("detector")]
+        if not vuln_classes:
+            return {"content": [{"type": "text", "text": "No detector outputs to review."}]}
+
+        ctx.progress.update(3, 6, f"Manager review for {len(vuln_classes)} classes")
+
+        futures: dict[str, Future] = {
+            vc: run_manager_review.awaitable(
+                vc, stage_outputs[vc]["detector"], request,
+            ).run()
+            for vc in vuln_classes
+        }
+        Future.wait(futures.values(), return_when=RETURN_WHEN.ALL_COMPLETED)
+
+        results_text = []
+        for vc, fut in futures.items():
+            try:
+                output = fut.result()
+            except Exception as exc:
+                output = f"[manager_future_error for {vc}]: {exc}"
+            stage_outputs[vc]["manager"] = output
+            results_text.append(f"## {vc}\n\n{output}")
+
+        combined = "\n\n---\n\n".join(results_text)
+        return {"content": [{"type": "text", "text": f"Manager review complete.\n\n{combined}"}]}
+
+    @tool(
+        "run_validators",
+        "Run validation tests on approved findings in parallel.",
+        {"type": "object", "properties": {}},
+    )
+    async def run_validators_tool(args: dict[str, Any]) -> dict[str, Any]:
+        vuln_classes = [
+            vc for vc in request.vulnerability_classes
+            if stage_outputs[vc].get("manager")
+        ]
+        if not vuln_classes:
+            return {"content": [{"type": "text", "text": "No manager outputs to validate."}]}
+
+        ctx.progress.update(4, 6, f"Validating {len(vuln_classes)} classes")
+
+        futures: dict[str, Future] = {
+            vc: run_validator.awaitable(
+                vc,
+                stage_outputs[vc]["detector"],
+                stage_outputs[vc]["manager"],
+                request,
+            ).run()
+            for vc in vuln_classes
+        }
+        Future.wait(futures.values(), return_when=RETURN_WHEN.ALL_COMPLETED)
+
+        results_text = []
+        for vc, fut in futures.items():
+            try:
+                output = fut.result()
+            except Exception as exc:
+                output = f"[validator_future_error for {vc}]: {exc}"
+            stage_outputs[vc]["validator"] = output
+            results_text.append(f"## {vc}\n\n{output}")
+
+        combined = "\n\n---\n\n".join(results_text)
+        return {"content": [{"type": "text", "text": f"Validation complete.\n\n{combined}"}]}
+
+    @tool(
+        "run_fixers",
+        "Generate fix patches for confirmed findings in parallel.",
+        {"type": "object", "properties": {}},
+    )
+    async def run_fixers_tool(args: dict[str, Any]) -> dict[str, Any]:
+        vuln_classes = [
+            vc for vc in request.vulnerability_classes
+            if stage_outputs[vc].get("validator")
+        ]
+        if not vuln_classes:
+            return {"content": [{"type": "text", "text": "No validated findings to fix."}]}
+
+        ctx.progress.update(5, 6, f"Generating fixes for {len(vuln_classes)} classes")
+
+        futures: dict[str, Future] = {
+            vc: run_fixer.awaitable(
+                vc,
+                stage_outputs[vc]["detector"],
+                stage_outputs[vc]["manager"],
+                stage_outputs[vc]["validator"],
+                request,
+            ).run()
+            for vc in vuln_classes
+        }
+        Future.wait(futures.values(), return_when=RETURN_WHEN.ALL_COMPLETED)
+
+        results_text = []
+        for vc, fut in futures.items():
+            try:
+                output = fut.result()
+            except Exception as exc:
+                output = f"[fixer_future_error for {vc}]: {exc}"
+            stage_outputs[vc]["fixer"] = output
+            results_text.append(f"## {vc}\n\n{output}")
+
+        combined = "\n\n---\n\n".join(results_text)
+        return {"content": [{"type": "text", "text": f"Fix generation complete.\n\n{combined}"}]}
+
+    # ── Create MCP server with coordinator tools ───────────────────────
+    server = create_sdk_mcp_server(
+        "security-coordinator",
+        version="1.0.0",
+        tools=[run_detectors_tool, run_managers_tool, run_validators_tool, run_fixers_tool],
+    )
+
+    # ── Run the coordinator agent ──────────────────────────────────────
+    coordinator_prompt = (
+        "You are coordinating a security vulnerability sweep.\n\n"
+        f"Repository: {request.repo_url or request.repo_path}\n"
+        f"Branch: {request.repo_branch or 'default'}\n"
+        f"Files scanned: {files_scanned}\n"
+        f"Vulnerability classes: {', '.join(request.vulnerability_classes)}\n"
+        f"Validation enabled: {request.run_validation}\n"
+        f"Fix generation enabled: {request.generate_fixes}\n\n"
+        "Execute the full security sweep now.  Call each tool in order:\n"
+        f"1. run_detectors with vulnerability_classes={json.dumps(request.vulnerability_classes)}\n"
+        "2. run_managers\n"
+        + ("3. run_validators\n" if request.run_validation else "")
+        + ("4. run_fixers\n" if request.generate_fixes else "")
+        + "\nAfter all stages complete, provide a concise summary of results."
+    )
+
+    async def _coordinate():
+        async with ClaudeSDKClient(
+            options=ClaudeAgentOptions(
+                system_prompt=COORDINATOR_SKILL,
+                mcp_servers={"tools": server},
+                allowed_tools=[
+                    "mcp__tools__run_detectors",
+                    "mcp__tools__run_managers",
+                    "mcp__tools__run_validators",
+                    "mcp__tools__run_fixers",
+                ],
+                permission_mode="bypassPermissions",
+                max_turns=10,
+            ),
+        ) as client:
+            await client.query(coordinator_prompt)
+            async for _msg in client.receive_response():
+                # Emit progress when coordinator invokes MCP tools
+                if hasattr(_msg, "content") and _msg.content:
+                    for block in _msg.content:
+                        if getattr(block, "type", None) == "tool_use":
+                            try:
+                                ctx.progress.update(
+                                    1, 6,
+                                    f"Coordinator: {getattr(block, 'name', '')}",
+                                )
+                            except Exception:
+                                pass
+
+    asyncio.run(_coordinate())
+
+    # ── Build the final report from accumulated text artifacts ──────────
+    summary = _build_report_markdown(request, files_scanned, stage_outputs)
+
+    ctx.progress.update(6, 6, "Security sweep complete")
 
     return SecuritySweepReport(
         repo_path=request.repo_url or request.repo_path,
         repo_branch=request.repo_branch,
-        files_scanned=len(snippets),
-        detectors_run=len(request.vulnerability_classes),
-        findings_detected=len(candidates),
-        findings_approved=approved_count,
-        findings_confirmed=confirmed_count,
-        fixes_generated=fixes_generated,
-        detector_results=detector_results,
-        findings=lifecycle_items,
+        files_scanned=files_scanned,
+        vulnerability_classes=request.vulnerability_classes,
         summary_markdown=summary,
+        stage_outputs=stage_outputs,
     )
 
+
+# ---------------------------------------------------------------------------
+# Local runner
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     def _parse_list_env(name: str, default: list[str]) -> list[str]:
@@ -1049,7 +788,7 @@ if __name__ == "__main__":
         repo_url=os.getenv("SCAN_REPO_URL", ""),
         repo_branch=os.getenv("SCAN_REPO_BRANCH", ""),
         repo_path=os.getenv("SCAN_REPO_PATH", "."),
-        include_globs=_parse_list_env("SCAN_INCLUDE_GLOBS", ["**/*.py"]),
+        include_globs=_parse_list_env("SCAN_INCLUDE_GLOBS", ["**/*.py", "**/*.js", "**/*.ts", "**/*.rs", "**/*.go"]),
         exclude_globs=_parse_list_env(
             "SCAN_EXCLUDE_GLOBS",
             ["**/.venv/**", "**/venv/**", "**/node_modules/**"],
