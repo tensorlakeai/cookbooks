@@ -10,7 +10,6 @@ This application demonstrates:
 No hardcoded file lists. The deployer discovers what files exist
 in a template directory and fetches them all in parallel.
 """
-
 import ast
 import os
 import re
@@ -101,7 +100,7 @@ class FileToFetch:
     download_url: str
 
 
-@application(input_deserializer="json", output_serializer="json")
+@application()
 @function(timeout=180)
 def deploy_template(request: dict) -> dict:
     """
@@ -258,7 +257,7 @@ def deploy_template(request: dict) -> dict:
     }
 
 
-@function(timeout=30, retries=Retries(max_retries=2))
+@function(timeout=30, retries=Retries(max_retries=2), image=deployer_image)
 def discover_template_files(repo: str, branch: str, template_id: str) -> dict:
     """
     Discover files in a template directory using GitHub Contents API.
@@ -275,8 +274,9 @@ def discover_template_files(repo: str, branch: str, template_id: str) -> dict:
         "User-Agent": "tensorlake-template-deployer",
     }
 
+    _github_timeout = 15
     try:
-        response = httpx.get(url, params=params, headers=headers, timeout=15)
+        response = httpx.get(url, params=params, headers=headers, timeout=_github_timeout)
 
         if response.status_code == 404:
             return {"error": f"Template '{template_id}' not found in {repo}@{branch}"}
@@ -310,12 +310,12 @@ def discover_template_files(repo: str, branch: str, template_id: str) -> dict:
         return {"files": files}
 
     except httpx.TimeoutException:
-        return {"error": "GitHub API request timed out"}
+        return {"error": f"GitHub API request timed out after {_github_timeout}"}
     except Exception as e:
         return {"error": f"GitHub API error: {str(e)}"}
 
 
-@function(timeout=30, retries=Retries(max_retries=3))
+@function(timeout=30, retries=Retries(max_retries=3), image=deployer_image)
 def fetch_file(download_url: str) -> Optional[str]:
     """
     Fetch a single file from GitHub raw URL.
