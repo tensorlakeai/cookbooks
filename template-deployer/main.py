@@ -36,7 +36,7 @@ def find_application_function_name(source_code: str) -> Optional[str]:
         tree = ast.parse(source_code)
 
         for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 # Check if this function has an @application decorator
                 for decorator in node.decorator_list:
                     decorator_name = None
@@ -52,6 +52,17 @@ def find_application_function_name(source_code: str) -> Optional[str]:
         return None
     except SyntaxError:
         return None
+
+
+def find_entrypoint_file(files: Dict[str, str]) -> Optional[Tuple[str, str]]:
+    """Scan all .py files for the @application decorator. Returns (filename, func_name) or None."""
+    for name, content in files.items():
+        if not name.endswith(".py"):
+            continue
+        func_name = find_application_function_name(content)
+        if func_name:
+            return (name, func_name)
+    return None
 
 
 def rename_application_function(source_code: str, old_name: str, new_name: str) -> str:
@@ -155,15 +166,6 @@ def deploy_template(request: dict) -> dict:
             "error": f"Template '{req.template_id}' is empty or not found"
         }
 
-    # Validate main.py exists
-    if not any(f.name == "main.py" for f in files_to_fetch):
-        print(f"[ERROR] Template '{req.template_id}' is missing main.py")
-        sys.stdout.flush()
-        return {
-            "success": False,
-            "error": f"Template '{req.template_id}' is missing main.py"
-        }
-
     print(f"[SUCCESS] Found {len(files_to_fetch)} files to deploy")
     for f in files_to_fetch:
         print(f"[INFO]   - {f.name}")
@@ -192,27 +194,26 @@ def deploy_template(request: dict) -> dict:
     print(f"[SUCCESS] All {len(files)} files fetched successfully")
     sys.stdout.flush()
 
-    # Stage 3: Rename application function to requested app_name
-    print(f"[STAGE] Renaming application to: {req.app_name}")
+    # Stage 3: Auto-detect entrypoint and rename application function
+    print(f"[STAGE] Detecting entrypoint and renaming application to: {req.app_name}")
     sys.stdout.flush()
 
-    main_py_content = files.get("main.py", "")
-    original_func_name = find_application_function_name(main_py_content)
-
-    if not original_func_name:
-        print(f"[ERROR] Could not find @application decorated function in main.py")
+    entrypoint = find_entrypoint_file(files)
+    if not entrypoint:
+        print(f"[ERROR] No @application decorated function found in any .py file")
         sys.stdout.flush()
         return {
             "success": False,
-            "error": "Could not find @application decorated function in main.py"
+            "error": "No @application decorated function found in any .py file"
         }
 
-    print(f"[INFO] Found application function: {original_func_name}")
+    entrypoint_file, original_func_name = entrypoint
+    print(f"[INFO] Found application function '{original_func_name}' in {entrypoint_file}")
 
     if original_func_name != req.app_name:
         print(f"[INFO] Renaming: {original_func_name} -> {req.app_name}")
-        updated_main_py = rename_application_function(main_py_content, original_func_name, req.app_name)
-        files["main.py"] = updated_main_py
+        updated_content = rename_application_function(files[entrypoint_file], original_func_name, req.app_name)
+        files[entrypoint_file] = updated_content
         print(f"[SUCCESS] Application renamed successfully")
     else:
         print(f"[INFO] Application name already matches, no rename needed")
@@ -228,6 +229,7 @@ def deploy_template(request: dict) -> dict:
         namespace=req.target_namespace,
         api_key=req.deployment_api_key,
         api_url=req.api_url,
+        entrypoint_file=entrypoint_file,
     )
 
     if not deploy_result["success"]:
@@ -340,7 +342,7 @@ def fetch_file(download_url: str) -> Optional[str]:
 
 
 @function(timeout=120, image=deployer_image)
-def deploy_via_cli(files: Dict[str, str], namespace: str, api_key: str, api_url: Optional[str] = None) -> dict:
+def deploy_via_cli(files: Dict[str, str], namespace: str, api_key: str, entrypoint_file: str, api_url: Optional[str] = None) -> dict:
     """
     Deploy application using tensorlake CLI.
 
@@ -363,7 +365,7 @@ def deploy_via_cli(files: Dict[str, str], namespace: str, api_key: str, api_url:
             print(f"[INFO] Wrote {filename}")
         sys.stdout.flush()
 
-        main_path = os.path.join(tmpdir, "main.py")
+        main_path = os.path.join(tmpdir, entrypoint_file)
 
         try:
             # Run tensorlake deploy with API key via environment variable
@@ -373,7 +375,7 @@ def deploy_via_cli(files: Dict[str, str], namespace: str, api_key: str, api_url:
             if api_url:
                 env["TENSORLAKE_API_URL"] = api_url
 
-            print(f"[CLI] Running: tensorlake --namespace {namespace} deploy main.py")
+            print(f"[CLI] Running: tensorlake --namespace {namespace} deploy {entrypoint_file}")
             sys.stdout.flush()
 
             # Use Popen for streaming output line-by-line
