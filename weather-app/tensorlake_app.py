@@ -5,8 +5,6 @@ Defines the workflow for handling weather queries.
 
 from tensorlake.applications import application, function, run_local_application, Request, Image
 
-from agent import run_agent
-
 # Define image with required dependencies
 weather_agent_image = (
     Image()
@@ -26,6 +24,8 @@ def handle_weather_query(query: str) -> str:
     Returns:
         The agent's response
     """
+    from agent import run_agent
+
     return run_agent(query)
 
 

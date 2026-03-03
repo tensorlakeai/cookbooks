@@ -7,10 +7,6 @@ import os
 import httpx
 from pydantic import BaseModel, Field
 from tensorlake.applications import Image, Request, application, function, run_local_application
-from twilio.rest import Client
-
-from agent import run_agent
-import db
 
 # Image with all required dependencies
 workout_agent_image = (
@@ -46,6 +42,8 @@ class TwilioWebhook(BaseModel):
 @function(image=workout_agent_image, secrets=["OPENAI_API_KEY", "DATABASE_URL_WORKOUT_APP"], min_containers=2)
 def handle_message(request: MessageRequest) -> str:
     """Handle a user message and return the coach's response."""
+    from agent import run_agent
+    import db
 
     async def _run():
         await db.init_db()
@@ -110,6 +108,9 @@ def _split_sms(text: str, max_len: int = SMS_MAX_LEN) -> list[str]:
 )
 def handle_sms(request: TwilioWebhook) -> str:
     """Handle an incoming SMS via Twilio and send the coach's reply."""
+    from agent import run_agent
+    from twilio.rest import Client
+    import db
 
     # Download media from Twilio (requires auth) and convert to base64 data URLs
     media = None
