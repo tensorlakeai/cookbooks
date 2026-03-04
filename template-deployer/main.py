@@ -112,7 +112,7 @@ class FileToFetch:
 
 
 @application()
-@function(timeout=180)
+@function(timeout=300)
 def deploy_template(request: dict) -> dict:
     """
     Deploy a template from a GitHub repository.
@@ -341,7 +341,7 @@ def fetch_file(download_url: str) -> Optional[str]:
         return None
 
 
-@function(timeout=120, image=deployer_image)
+@function(timeout=270, image=deployer_image)
 def deploy_via_cli(files: Dict[str, str], namespace: str, api_key: str, entrypoint_file: str, api_url: Optional[str] = None) -> dict:
     """
     Deploy application using tensorlake CLI.
