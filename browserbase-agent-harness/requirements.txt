@@ -1,0 +1,10 @@
+tensorlake
+openai
+openai-agents
+pydantic
+browserbase
+playwright
+elasticsearch
+requests
+pypdf
+python-docx

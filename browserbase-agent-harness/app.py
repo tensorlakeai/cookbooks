@@ -22,14 +22,30 @@ from io import BytesIO
 from typing import Any
 from urllib.parse import quote_plus, urlparse
 
-from pydantic import BaseModel, Field
+from models import (
+    AgenticQueryInput,
+    BrowserFetchInput,
+    BrowserSearchInput,
+    BrowserSnippetInput,
+    DocumentToMarkdownInput,
+    DownloadFileInput,
+    ElasticsearchBulkIngestInput,
+    ElasticsearchIndexNoteInput,
+    ElasticsearchSearchInput,
+    ExtractArchiveInput,
+)
+from pydantic import BaseModel
+from prompts import SYSTEM_INSTRUCTIONS, build_agent_prompt
 from tensorlake.applications import (
+    Future,
     Image,
     RequestContext,
+    RETURN_WHEN,
     application,
     function,
     run_local_application,
 )
+from tracing_utils import append_trace, register_agents_trace_sink
 
 # ---------------------------------------------------------------------------
 # Tensorlake images
@@ -49,167 +65,6 @@ document_image = Image(name="document-tools-image").run(
 elastic_image = Image(name="elasticsearch-tools-image").run(
     "pip install elasticsearch pydantic tensorlake"
 )
-
-
-# ---------------------------------------------------------------------------
-# Pydantic models
-# ---------------------------------------------------------------------------
-class AgenticQueryInput(BaseModel):
-    query: str = Field(description="Question the agent should answer")
-    website: str = Field(description="Seed website to explore")
-    openai_model: str = Field(
-        default_factory=lambda: os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-        description="OpenAI model used for the harness",
-    )
-    max_iterations: int = Field(default=8, ge=1, le=20)
-    max_pages: int = Field(default=6, ge=1, le=20)
-    agent_timeout_seconds: int = Field(
-        default=300,
-        ge=30,
-        le=3600,
-        description="Hard timeout for Agents SDK orchestration stage",
-    )
-    auto_search_phase: bool = Field(
-        default=True,
-        description="Use search-bar exploration with reframed queries before main loop",
-    )
-    search_variations: int = Field(
-        default=5,
-        ge=1,
-        le=12,
-        description="Number of reframed search queries to run during auto search phase",
-    )
-    search_results_per_variation: int = Field(
-        default=8,
-        ge=1,
-        le=20,
-        description="Max search results captured per variation",
-    )
-    prefetch_from_search_results: int = Field(
-        default=4,
-        ge=0,
-        le=20,
-        description="How many discovered URLs to prefetch as evidence",
-    )
-    enable_elasticsearch: bool = Field(
-        default=False,
-        description="Whether to index intermediate and final artifacts into Elasticsearch",
-    )
-    enable_tracing: bool = Field(
-        default=True,
-        description="Whether to collect detailed step-by-step trace events",
-    )
-    max_trace_events: int = Field(
-        default=300,
-        ge=20,
-        le=2000,
-        description="Maximum trace events retained in output",
-    )
-    browserbase_project_id: str = Field(
-        default_factory=lambda: os.getenv("BROWSERBASE_PROJECT_ID", ""),
-        description="Browserbase project ID",
-    )
-    browserbase_api_key: str = Field(
-        default_factory=lambda: os.getenv("BROWSERBASE_API_KEY", ""),
-        description="Browserbase API key",
-    )
-    elasticsearch_url: str = Field(
-        default_factory=lambda: os.getenv("ELASTICSEARCH_URL", ""),
-        description="Elasticsearch endpoint URL",
-    )
-    elasticsearch_api_key: str = Field(
-        default_factory=lambda: os.getenv("ELASTIC_API_KEY", ""),
-        description="Elasticsearch API key",
-    )
-    elasticsearch_index: str = Field(default="browserbase_agent_runs")
-
-
-class BrowserFetchInput(BaseModel):
-    url: str
-    allowed_domain: str | None = None
-    max_links: int = Field(default=25, ge=1, le=100)
-    max_chars: int = Field(default=9000, ge=1000, le=25000)
-    timeout_ms: int = Field(default=45000, ge=5000, le=120000)
-    wait_after_load_ms: int = Field(default=1000, ge=0, le=10000)
-    browserbase_project_id: str = ""
-    browserbase_api_key: str = ""
-
-
-class BrowserSnippetInput(BaseModel):
-    url: str
-    query: str
-    allowed_domain: str | None = None
-    max_snippets: int = Field(default=5, ge=1, le=20)
-    snippet_chars: int = Field(default=260, ge=80, le=1000)
-    browserbase_project_id: str = ""
-    browserbase_api_key: str = ""
-
-
-class BrowserSearchInput(BaseModel):
-    start_url: str
-    search_query: str
-    allowed_domain: str | None = None
-    max_results: int = Field(default=8, ge=1, le=30)
-    timeout_ms: int = Field(default=45000, ge=5000, le=120000)
-    wait_after_load_ms: int = Field(default=1000, ge=0, le=10000)
-    wait_after_submit_ms: int = Field(default=1200, ge=0, le=10000)
-    browserbase_project_id: str = ""
-    browserbase_api_key: str = ""
-
-
-class DownloadFileInput(BaseModel):
-    url: str
-    allowed_domain: str | None = None
-    max_bytes: int = Field(default=8_000_000, ge=10_000, le=40_000_000)
-    timeout_seconds: int = Field(default=60, ge=5, le=240)
-
-
-class ExtractArchiveInput(BaseModel):
-    file_b64: str
-    filename: str
-    max_files: int = Field(default=50, ge=1, le=500)
-    max_bytes_per_file: int = Field(default=1_000_000, ge=10_000, le=10_000_000)
-
-
-class DocumentToMarkdownInput(BaseModel):
-    file_b64: str
-    filename: str
-    query: str | None = None
-    max_chars: int = Field(default=25_000, ge=1_000, le=120_000)
-    openai_model: str = Field(
-        default_factory=lambda: os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-    )
-
-
-class ElasticsearchIndexNoteInput(BaseModel):
-    index: str
-    run_id: str
-    query: str
-    website: str
-    note: str
-    url: str | None = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
-    elasticsearch_url: str = ""
-    elasticsearch_api_key: str = ""
-
-
-class ElasticsearchSearchInput(BaseModel):
-    index: str
-    query: str
-    run_id: str | None = None
-    size: int = Field(default=5, ge=1, le=20)
-    elasticsearch_url: str = ""
-    elasticsearch_api_key: str = ""
-
-
-class ElasticsearchBulkIngestInput(BaseModel):
-    index: str
-    run_id: str
-    query: str
-    website: str
-    pages: list[dict[str, Any]]
-    elasticsearch_url: str = ""
-    elasticsearch_api_key: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -236,33 +91,6 @@ def _resolve_required(value: str, env_name: str, label: str) -> str:
     return resolved
 
 
-def _sanitize_for_trace(value: Any, depth: int = 0) -> Any:
-    if depth > 4:
-        return "<max-depth>"
-
-    if isinstance(value, dict):
-        masked = {}
-        for key, val in value.items():
-            key_l = str(key).lower()
-            if any(token in key_l for token in ["api_key", "token", "secret", "password"]):
-                masked[key] = "***redacted***"
-            else:
-                masked[key] = _sanitize_for_trace(val, depth + 1)
-        return masked
-
-    if isinstance(value, list):
-        if len(value) > 30:
-            return [_sanitize_for_trace(v, depth + 1) for v in value[:30]] + ["<truncated>"]
-        return [_sanitize_for_trace(v, depth + 1) for v in value]
-
-    if isinstance(value, str):
-        if len(value) > 800:
-            return value[:800] + "...<truncated>"
-        return value
-
-    return value
-
-
 def _append_trace(
     traces: list[dict[str, Any]],
     enabled: bool,
@@ -270,55 +98,14 @@ def _append_trace(
     event: str,
     details: dict[str, Any],
 ) -> None:
-    if not enabled:
-        return
-    if len(traces) >= max_events:
-        return
-
-    entry = {
-        "timestamp": _now_iso(),
-        "event": event,
-        "details": _sanitize_for_trace(details),
-    }
-    traces.append(entry)
-    print(f"[TRACE] {json.dumps(entry, ensure_ascii=True)}")
-
-
-def _summarize_tool_result(result: Any) -> dict[str, Any]:
-    if not isinstance(result, dict):
-        return {"result_type": type(result).__name__}
-
-    summary: dict[str, Any] = {}
-    for key in [
-        "success",
-        "error",
-        "url",
-        "title",
-        "count",
-        "indexed_pages",
-        "errors",
-        "message",
-    ]:
-        if key in result:
-            summary[key] = result[key]
-
-    if "links" in result:
-        summary["links_count"] = len(result.get("links", []))
-    if "snippets" in result:
-        summary["snippets_count"] = len(result.get("snippets", []))
-    if "results" in result:
-        summary["results_count"] = len(result.get("results", []))
-    if "files" in result:
-        summary["files_count"] = len(result.get("files", []))
-    if "search_url" in result:
-        summary["search_url"] = result.get("search_url")
-    if "filename" in result:
-        summary["filename"] = result.get("filename")
-    if "text" in result:
-        summary["text_chars"] = len(result.get("text", "") or "")
-    if "markdown" in result:
-        summary["markdown_chars"] = len(result.get("markdown", "") or "")
-    return summary
+    """Thin adapter to keep callsites compact; implementation lives in tracing_utils."""
+    append_trace(
+        traces=traces,
+        enabled=enabled,
+        max_events=max_events,
+        event=event,
+        details=details,
+    )
 
 
 def _extract_snippets(text: str, query: str, max_snippets: int, snippet_chars: int) -> list[str]:
@@ -1463,7 +1250,8 @@ def _execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
 )
 def agentic_search(input: AgenticQueryInput) -> dict[str, Any]:
     """Agentic query harness using OpenAI Agents SDK wrappers over Tensorlake tools."""
-    from agents import Agent, Runner, function_tool
+    from agents import Agent, RunConfig, Runner, function_tool
+    from agents.tracing import gen_trace_id
 
     ctx = RequestContext.get()
     run_id = str(uuid.uuid4())
@@ -1487,6 +1275,26 @@ def agentic_search(input: AgenticQueryInput) -> dict[str, Any]:
     final_answer = ""
     progress_current = 0.0
     agent_phase_started = False
+    agents_trace_workflow_name = "Browserbase Agent Harness"
+    agents_trace_id = gen_trace_id() if input.enable_tracing else None
+    agents_trace_group_id = run_id
+    agents_trace_metadata = {
+        "harness_run_id": run_id,
+        "query": input.query,
+        "website": input.website,
+        "allowed_domain": allowed_domain,
+        "model": input.openai_model,
+        "max_iterations": input.max_iterations,
+        "max_pages": input.max_pages,
+    }
+    agents_run_config = RunConfig(
+        tracing_disabled=not input.enable_tracing,
+        trace_include_sensitive_data=True,
+        workflow_name=agents_trace_workflow_name,
+        trace_id=agents_trace_id,
+        group_id=agents_trace_group_id,
+        trace_metadata=agents_trace_metadata,
+    )
 
     def _trim_text(value: str, max_chars: int) -> str:
         if not value:
@@ -1502,17 +1310,6 @@ def agentic_search(input: AgenticQueryInput) -> dict[str, Any]:
     def _track_tool(tool_name: str, args: dict[str, Any], result: dict[str, Any]) -> None:
         nonlocal tool_calls_executed
         tool_calls_executed += 1
-        _append_trace(
-            traces,
-            input.enable_tracing,
-            input.max_trace_events,
-            "agent_tool_result",
-            {
-                "tool_name": tool_name,
-                "args": args,
-                "result_summary": _summarize_tool_result(result),
-            },
-        )
         if agent_phase_started:
             _emit_progress(
                 min(progress_current + 1.5, 90.0),
@@ -1568,6 +1365,18 @@ def agentic_search(input: AgenticQueryInput) -> dict[str, Any]:
         }
         return file_id
 
+    def _run_function_future(fn: Any, *args: Any, **kwargs: Any) -> Future:
+        future_factory = getattr(fn, "future", None)
+        if callable(future_factory):
+            return future_factory(*args, **kwargs).run()
+        awaitable_factory = getattr(fn, "awaitable", None)
+        if callable(awaitable_factory):
+            return awaitable_factory(*args, **kwargs).run()
+        raise AttributeError(
+            "Tensorlake Function object does not expose a supported future factory "
+            "(`future` or `awaitable`)."
+        )
+
     _append_trace(
         traces,
         input.enable_tracing,
@@ -1587,6 +1396,18 @@ def agentic_search(input: AgenticQueryInput) -> dict[str, Any]:
             "prefetch_from_search_results": input.prefetch_from_search_results,
             "enable_elasticsearch": input.enable_elasticsearch,
             "model": input.openai_model,
+        },
+    )
+    _append_trace(
+        traces,
+        input.enable_tracing,
+        input.max_trace_events,
+        "agents_sdk_trace_configured",
+        {
+            "workflow_name": agents_trace_workflow_name,
+            "trace_id": agents_trace_id,
+            "group_id": agents_trace_group_id,
+            "metadata": agents_trace_metadata,
         },
     )
     _emit_progress(
@@ -1615,23 +1436,50 @@ def agentic_search(input: AgenticQueryInput) -> dict[str, Any]:
 
     if input.auto_search_phase:
         search_total = max(len(query_variations), 1)
-        for idx, variation in enumerate(query_variations):
+        _emit_progress(
+            8,
+            f"Launching {search_total} auto-search variations in parallel",
+            {"variations": search_total},
+        )
+
+        search_futures: list[tuple[str, Future]] = []
+        for variation in query_variations:
+            search_futures.append(
+                (
+                    variation,
+                    _run_function_future(
+                        browser_search_site,
+                        BrowserSearchInput(
+                            start_url=input.website,
+                            search_query=variation,
+                            allowed_domain=allowed_domain,
+                            max_results=input.search_results_per_variation,
+                            browserbase_project_id=input.browserbase_project_id,
+                            browserbase_api_key=input.browserbase_api_key,
+                        )
+                    ),
+                )
+            )
+
+        if search_futures:
+            Future.wait((future for _, future in search_futures), return_when=RETURN_WHEN.ALL_COMPLETED)
+
+        for idx, (variation, future) in enumerate(search_futures):
             _emit_progress(
                 8 + ((idx / search_total) * 35),
                 f"Auto-search variation {idx + 1}/{search_total}",
                 {"variation": variation},
             )
 
-            result = browser_search_site(
-                BrowserSearchInput(
-                    start_url=input.website,
-                    search_query=variation,
-                    allowed_domain=allowed_domain,
-                    max_results=input.search_results_per_variation,
-                    browserbase_project_id=input.browserbase_project_id,
-                    browserbase_api_key=input.browserbase_api_key,
-                )
-            )
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = {
+                    "success": False,
+                    "error": f"Auto-search future failed: {exc}",
+                    "search_url": "",
+                    "results": [],
+                }
             _track_tool("browser_search_site", {"variation": variation}, result)
 
             compact_results = []
@@ -1669,30 +1517,60 @@ def agentic_search(input: AgenticQueryInput) -> dict[str, Any]:
                 },
             )
 
-        prefetch_count = 0
+        prefetch_budget = min(
+            input.prefetch_from_search_results,
+            max(0, input.max_pages - len(visited_pages)),
+        )
+        prefetch_targets: list[str] = []
         for url in candidate_urls:
-            if prefetch_count >= input.prefetch_from_search_results:
-                break
-            if len(visited_pages) >= input.max_pages:
+            if len(prefetch_targets) >= prefetch_budget:
                 break
             if url in visited_pages:
                 continue
+            prefetch_targets.append(url)
 
+        prefetch_count = 0
+        if prefetch_targets:
             _emit_progress(
-                45 + (prefetch_count * 5),
-                f"Prefetching snippets from candidate URL {prefetch_count + 1}",
+                45,
+                "Launching snippet prefetch calls in parallel",
+                {"targets": len(prefetch_targets)},
+            )
+
+        snippet_futures: list[tuple[str, Future]] = [
+            (
+                url,
+                _run_function_future(
+                    browser_find_relevant_snippets,
+                    BrowserSnippetInput(
+                        url=url,
+                        query=input.query,
+                        allowed_domain=allowed_domain,
+                        max_snippets=5,
+                        browserbase_project_id=input.browserbase_project_id,
+                        browserbase_api_key=input.browserbase_api_key,
+                    )
+                ),
+            )
+            for url in prefetch_targets
+        ]
+        if snippet_futures:
+            Future.wait((future for _, future in snippet_futures), return_when=RETURN_WHEN.ALL_COMPLETED)
+
+        for idx, (url, future) in enumerate(snippet_futures):
+            _emit_progress(
+                45 + (idx * 5),
+                f"Prefetching snippets from candidate URL {idx + 1}",
                 {"url": url},
             )
-            snippet_result = browser_find_relevant_snippets(
-                BrowserSnippetInput(
-                    url=url,
-                    query=input.query,
-                    allowed_domain=allowed_domain,
-                    max_snippets=5,
-                    browserbase_project_id=input.browserbase_project_id,
-                    browserbase_api_key=input.browserbase_api_key,
-                )
-            )
+            try:
+                snippet_result = future.result()
+            except Exception as exc:
+                snippet_result = {
+                    "success": False,
+                    "error": f"Snippet prefetch future failed: {exc}",
+                    "url": url,
+                }
             _track_tool("browser_find_relevant_snippets", {"url": url}, snippet_result)
             if snippet_result.get("success"):
                 snippet_url = snippet_result.get("url")
@@ -1717,13 +1595,6 @@ def agentic_search(input: AgenticQueryInput) -> dict[str, Any]:
     @function_tool
     def search_site(search_query: str) -> str:
         """Search the target site using its search bar with a query variation."""
-        _append_trace(
-            traces,
-            input.enable_tracing,
-            input.max_trace_events,
-            "agent_tool_called",
-            {"tool_name": "search_site", "search_query": search_query},
-        )
         result = browser_search_site(
             BrowserSearchInput(
                 start_url=input.website,
@@ -1745,13 +1616,6 @@ def agentic_search(input: AgenticQueryInput) -> dict[str, Any]:
     @function_tool
     def fetch_page(url: str, max_chars: int = 9000, max_links: int = 25) -> str:
         """Fetch page content and links from a URL."""
-        _append_trace(
-            traces,
-            input.enable_tracing,
-            input.max_trace_events,
-            "agent_tool_called",
-            {"tool_name": "fetch_page", "url": url},
-        )
         if len(visited_pages) >= input.max_pages and url not in visited_pages:
             result = {"success": False, "error": f"Max page budget reached ({input.max_pages}).", "url": url}
             _track_tool("browser_fetch_page", {"url": url}, result)
@@ -1777,13 +1641,6 @@ def agentic_search(input: AgenticQueryInput) -> dict[str, Any]:
     @function_tool
     def find_snippets(url: str, query: str) -> str:
         """Find query-relevant snippets from a page."""
-        _append_trace(
-            traces,
-            input.enable_tracing,
-            input.max_trace_events,
-            "agent_tool_called",
-            {"tool_name": "find_snippets", "url": url, "query": query},
-        )
         if len(visited_pages) >= input.max_pages and url not in visited_pages:
             result = {"success": False, "error": f"Max page budget reached ({input.max_pages}).", "url": url}
             _track_tool("browser_find_relevant_snippets", {"url": url, "query": query}, result)
@@ -1816,13 +1673,6 @@ def agentic_search(input: AgenticQueryInput) -> dict[str, Any]:
     @function_tool
     def download_document(url: str) -> str:
         """Download a file URL and cache it for archive/document tools."""
-        _append_trace(
-            traces,
-            input.enable_tracing,
-            input.max_trace_events,
-            "agent_tool_called",
-            {"tool_name": "download_document", "url": url},
-        )
         result = download_file(
             DownloadFileInput(url=url, allowed_domain=allowed_domain, max_bytes=8_000_000)
         )
@@ -1847,13 +1697,6 @@ def agentic_search(input: AgenticQueryInput) -> dict[str, Any]:
     @function_tool
     def unzip_file(file_id: str, max_files: int = 25) -> str:
         """Extract a cached archive and return child file IDs."""
-        _append_trace(
-            traces,
-            input.enable_tracing,
-            input.max_trace_events,
-            "agent_tool_called",
-            {"tool_name": "unzip_file", "file_id": file_id},
-        )
         cached = cached_files.get(file_id)
         if not cached:
             return json.dumps({"success": False, "error": f"Unknown file_id: {file_id}"})
@@ -1898,13 +1741,6 @@ def agentic_search(input: AgenticQueryInput) -> dict[str, Any]:
     @function_tool
     def read_document_as_markdown(file_id: str, focus_query: str = "") -> str:
         """Convert a cached document file into markdown via foundation model."""
-        _append_trace(
-            traces,
-            input.enable_tracing,
-            input.max_trace_events,
-            "agent_tool_called",
-            {"tool_name": "read_document_as_markdown", "file_id": file_id},
-        )
         cached = cached_files.get(file_id)
         if not cached:
             return json.dumps({"success": False, "error": f"Unknown file_id: {file_id}"})
@@ -1950,13 +1786,6 @@ def agentic_search(input: AgenticQueryInput) -> dict[str, Any]:
         @function_tool
         def index_note(note: str, url: str = "") -> str:
             """Index an intermediate note in Elasticsearch."""
-            _append_trace(
-                traces,
-                input.enable_tracing,
-                input.max_trace_events,
-                "agent_tool_called",
-                {"tool_name": "index_note", "url": url},
-            )
             result = elasticsearch_index_note(
                 ElasticsearchIndexNoteInput(
                     index=input.elasticsearch_index,
@@ -1976,13 +1805,6 @@ def agentic_search(input: AgenticQueryInput) -> dict[str, Any]:
         @function_tool
         def search_notes(query: str, size: int = 5) -> str:
             """Search run artifacts in Elasticsearch."""
-            _append_trace(
-                traces,
-                input.enable_tracing,
-                input.max_trace_events,
-                "agent_tool_called",
-                {"tool_name": "search_notes", "query": query},
-            )
             result = elasticsearch_search_notes(
                 ElasticsearchSearchInput(
                     index=input.elasticsearch_index,
@@ -1998,14 +1820,6 @@ def agentic_search(input: AgenticQueryInput) -> dict[str, Any]:
 
         openai_tools.extend([index_note, search_notes])
 
-    system_instructions = (
-        "You are an agentic web research assistant running on Tensorlake. "
-        "You can search a site, fetch pages, download files, unzip archives, and convert "
-        "documents to markdown. Always gather concrete evidence before concluding. "
-        "Use multiple query phrasings, inspect files when relevant, and return citations. "
-        "In your final answer include a short 'Search Evidence' section with concrete URLs and extracted facts."
-    )
-
     presearch_summary = [
         {
             "variation": item["variation"],
@@ -2016,27 +1830,20 @@ def agentic_search(input: AgenticQueryInput) -> dict[str, Any]:
         for item in search_phase_reports
     ]
 
-    prompt = (
-        f"Run ID: {run_id}\n"
-        f"User question: {input.query}\n"
-        f"Website: {input.website}\n"
-        f"Allowed domain: {allowed_domain}\n"
-        f"Max page budget: {input.max_pages}\n"
-        f"Suggested query variations: {json.dumps(query_variations)}\n"
-        f"Auto-search phase findings: {json.dumps(presearch_summary)}\n\n"
-        "Process guidance:\n"
-        "1) Start with site search using multiple variation queries.\n"
-        "2) Fetch/snippet the best pages.\n"
-        "3) If you see document/archive links (pdf/docx/zip/tar/csv/json), download and inspect them.\n"
-        "4) For archives, unzip then inspect relevant files.\n"
-        "5) Provide a concise final answer with citations (URLs and filenames).\n"
-        "6) Include 3-6 concrete evidence bullets from search/fetch output."
+    prompt = build_agent_prompt(
+        run_id=run_id,
+        query=input.query,
+        website=input.website,
+        allowed_domain=allowed_domain,
+        max_pages=input.max_pages,
+        query_variations_json=json.dumps(query_variations),
+        presearch_summary_json=json.dumps(presearch_summary),
     )
 
     _emit_progress(60, "Running OpenAI Agents SDK orchestration", {"run_id": run_id})
     agent = Agent(
         name="Browserbase File-Aware Research Agent",
-        instructions=system_instructions,
+        instructions=SYSTEM_INSTRUCTIONS,
         tools=openai_tools,
         model=input.openai_model,
     )
@@ -2053,13 +1860,21 @@ def agentic_search(input: AgenticQueryInput) -> dict[str, Any]:
                 "timeout_seconds": input.agent_timeout_seconds,
                 "thread_name": current_thread.name,
                 "is_main_thread": current_thread is threading.main_thread(),
+                "trace_id": agents_trace_id,
+                "trace_group_id": agents_trace_group_id,
+                "trace_workflow_name": agents_trace_workflow_name,
             },
         )
 
         async def _run_agent_with_timeout() -> Any:
             try:
                 return await asyncio.wait_for(
-                    Runner.run(agent, prompt, max_turns=input.max_iterations),
+                    Runner.run(
+                        agent,
+                        prompt,
+                        max_turns=input.max_iterations,
+                        run_config=agents_run_config,
+                    ),
                     timeout=input.agent_timeout_seconds,
                 )
             except asyncio.TimeoutError as exc:
@@ -2098,7 +1913,16 @@ def agentic_search(input: AgenticQueryInput) -> dict[str, Any]:
             return thread_result.get("value")
 
         try:
-            run_result = _run_agent_with_safe_asyncio()
+            with register_agents_trace_sink(
+                enabled=input.enable_tracing,
+                trace_id=agents_trace_id,
+                run_id=run_id,
+                workflow_name=agents_trace_workflow_name,
+                group_id=agents_trace_group_id,
+                traces=traces,
+                max_events=input.max_trace_events,
+            ):
+                run_result = _run_agent_with_safe_asyncio()
         finally:
             agent_phase_started = False
 
@@ -2319,6 +2143,13 @@ def agentic_search(input: AgenticQueryInput) -> dict[str, Any]:
         "pages_visited": len(visited_pages),
         "tool_calls": tool_calls_executed,
         "elasticsearch": elasticsearch_result,
+        "agents_sdk_tracing": {
+            "enabled": input.enable_tracing,
+            "workflow_name": agents_trace_workflow_name,
+            "trace_id": agents_trace_id,
+            "group_id": agents_trace_group_id,
+            "metadata": agents_trace_metadata,
+        },
         "trace_count": len(traces),
         "traces": traces,
     }
