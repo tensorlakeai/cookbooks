@@ -1,4 +1,3 @@
-import anthropic
 from prompts import SYSTEM_PROMPT
 
 # Built-in Anthropic tools - no custom implementation needed!
@@ -23,6 +22,8 @@ def run_agent(user_message: str) -> str:
     Uses Claude with built-in web_search and web_fetch tools.
     Anthropic's API handles the tool execution server-side.
     """
+    import anthropic
+
     client = anthropic.Anthropic()
     messages = [{"role": "user", "content": user_message}]
 

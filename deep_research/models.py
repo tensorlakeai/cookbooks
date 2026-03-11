@@ -6,6 +6,11 @@ Matches the Temporal + OpenAI agents example.
 from pydantic import BaseModel
 
 
+class ResearchQuery(BaseModel):
+    query: str
+    """The research question to answer."""
+
+
 class WebSearchItem(BaseModel):
     reason: str
     """Your reasoning for why this search is important to the query."""

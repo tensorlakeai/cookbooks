@@ -12,9 +12,7 @@ orchestration with Tensorlake's @application/@function and Futures.
 import asyncio
 import json
 
-from agents import Agent, Runner, WebSearchTool
-from agents.model_settings import ModelSettings
-
+from models import ResearchQuery
 from tensorlake.applications import (
     Future,
     Image,
@@ -25,8 +23,7 @@ from tensorlake.applications import (
     run_local_application,
 )
 
-from models import WebSearchItem, WebSearchPlan, ReportData
-from prompts import PLANNER_PROMPT, SEARCH_PROMPT, WRITER_PROMPT
+
 
 # ---------------------------------------------------------------------------
 # Container image shared by all functions
@@ -42,6 +39,11 @@ agent_image = Image(name="deep-research-agent").run(
 @function(image=agent_image, secrets=["OPENAI_API_KEY"])
 def plan_research(query: str) -> str:
     """Use the planner agent to generate a set of web searches for the query."""
+    from agents import Agent, Runner
+
+    from models import WebSearchPlan
+    from prompts import PLANNER_PROMPT
+
     planner = Agent(
         name="PlannerAgent",
         instructions=PLANNER_PROMPT,
@@ -59,6 +61,12 @@ def plan_research(query: str) -> str:
 @function(image=agent_image, secrets=["OPENAI_API_KEY"])
 def search_web(search_item_json: str) -> str:
     """Use the search agent to search and summarise results for one query."""
+    from agents import Agent, Runner, WebSearchTool
+    from agents.model_settings import ModelSettings
+
+    from models import WebSearchItem
+    from prompts import SEARCH_PROMPT
+
     item = WebSearchItem.model_validate_json(search_item_json)
     search_agent = Agent(
         name="SearchAgent",
@@ -77,6 +85,11 @@ def search_web(search_item_json: str) -> str:
 @function(image=agent_image, secrets=["OPENAI_API_KEY"])
 def write_report(context_json: str) -> str:
     """Use the writer agent to produce a detailed research report."""
+    from agents import Agent, Runner
+
+    from models import ReportData
+    from prompts import WRITER_PROMPT
+
     context = json.loads(context_json)
     writer = Agent(
         name="WriterAgent",
@@ -98,9 +111,12 @@ def write_report(context_json: str) -> str:
 # ---------------------------------------------------------------------------
 @application()
 @function(image=agent_image, secrets=["OPENAI_API_KEY"])
-def deep_research(query: str) -> str:
+def deep_research(request: ResearchQuery) -> str:
     """Orchestrate a full deep research pipeline for a given query."""
+    from models import ReportData, WebSearchPlan
+
     ctx = RequestContext.get()
+    query = request.query
 
     # Phase 1: Plan searches
     ctx.progress.update(1, 4, "Planning research...", {})
@@ -150,5 +166,5 @@ if __name__ == "__main__":
     query = "What are the economic impacts of AI on the job market?"
     print(f"Query: {query}\n")
     print("=" * 60)
-    request = run_local_application(deep_research, query)
-    print(request.output())
+    request_run = run_local_application(deep_research, ResearchQuery(query=query))
+    print(request_run.output())
