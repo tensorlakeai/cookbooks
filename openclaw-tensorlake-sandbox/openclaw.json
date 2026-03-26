@@ -1,0 +1,17 @@
+{
+  "agents": {
+    "defaults": {
+      "sandbox": {
+        "mode": "all",
+        "backend": "ssh",
+        "scope": "agent",
+        "workspaceAccess": "rw",
+        "ssh": {
+          "target": "ignored@ignored:22",
+          "command": "tensorlake-openclaw-shim",
+          "workspaceRoot": "/workspace"
+        }
+      }
+    }
+  }
+}
