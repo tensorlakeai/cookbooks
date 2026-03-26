@@ -34,14 +34,14 @@ tail -100 /tmp/playwright-install.log
 """
 
 
-@application(retries=Retries(max_retries=1))
+@application()
 @function()
 def competitive_analyst(domain: str, count: int) -> dict:
     companies = research_agent.future(domain, count)
     raw_artifacts = browser_agent.map(companies)
-    successful_artifacts = filter_successful(raw_artifacts)
+    successful_artifacts = filter_successful.future(raw_artifacts)
     scorecards = analysis_agent.map(successful_artifacts)
-    return report_agent(domain, count, companies, raw_artifacts, scorecards)
+    return report_agent.future(domain, count, companies, raw_artifacts, scorecards)
 
 
 @function(timeout=120, secrets=["ANTHROPIC_API_KEY"], retries=Retries(max_retries=1))
@@ -139,7 +139,12 @@ def browser_agent(company: dict) -> dict:
 
 @function()
 def filter_successful(artifacts: list[dict]) -> list[dict]:
-    return [artifact for artifact in artifacts if artifact.get("status") == "success"]
+    successful = [a for a in artifacts if a.get("status") == "success"]
+    failed = [a for a in artifacts if a.get("status") != "success"]
+    if failed:
+        names = [a.get("company", {}).get("name", "unknown") for a in failed]
+        print(f"Skipping {len(failed)} failed sites: {names}")
+    return successful
 
 
 @function(timeout=120, secrets=["ANTHROPIC_API_KEY"], retries=Retries(max_retries=1))
@@ -249,5 +254,12 @@ def _collect_browser_diagnostics(sandbox: object, proc: object | None, artifact_
 
 
 if __name__ == "__main__":
-    request = run_local_application(competitive_analyst, "AI coding assistants", 3)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Competitive Website Analyst")
+    parser.add_argument("domain", help="Market category to research (e.g. 'AI coding assistants')")
+    parser.add_argument("--count", type=int, default=5, help="Number of companies to discover (default: 5)")
+    args = parser.parse_args()
+
+    request = run_local_application(competitive_analyst, args.domain, args.count)
     print(json.dumps(request.output(), indent=2))

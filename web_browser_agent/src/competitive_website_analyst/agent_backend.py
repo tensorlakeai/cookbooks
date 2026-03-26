@@ -94,7 +94,11 @@ class ClaudeAgentSDKBackend:
 
     def research(self, domain: str, count: int) -> str:
         prompt = RESEARCH_PROMPT.format(domain=domain, count=count)
-        return self._run_query(prompt=prompt, max_turns=10)
+        return self._run_query(
+            prompt=prompt,
+            max_turns=10,
+            allowed_tools=["WebSearch", "WebFetch"],
+        )
 
     def drive_browser(self, company: Company, tools: BrowserTools) -> BrowserArtifact:
         return self._run_browser_agent(company=company, tools=tools)
@@ -105,16 +109,41 @@ class ClaudeAgentSDKBackend:
             url=artifact.company.url,
             metadata=(artifact.metadata or BrowserMetadata()).model_dump_json(),
         )
-        return self._run_query(prompt=prompt, max_turns=3)
+        screenshot_bytes: bytes | None = None
+        if artifact.screenshot_path:
+            try:
+                screenshot_bytes = open(artifact.screenshot_path, "rb").read()
+            except OSError:
+                pass
+        return self._run_query(prompt=prompt, max_turns=3, image=screenshot_bytes)
 
     def report(self, scorecards: list[Scorecard]) -> str:
         prompt = REPORT_PROMPT.format(scorecards=json.dumps([card.model_dump(mode="json") for card in scorecards]))
         return self._run_query(prompt=prompt, max_turns=4)
 
-    def _run_query(self, prompt: str, max_turns: int) -> str:
-        return _run_async(self._run_query_async(prompt=prompt, max_turns=max_turns))
+    def _run_query(
+        self,
+        prompt: str,
+        max_turns: int,
+        allowed_tools: list[str] | None = None,
+        image: bytes | None = None,
+    ) -> str:
+        return _run_async(
+            self._run_query_async(
+                prompt=prompt,
+                max_turns=max_turns,
+                allowed_tools=allowed_tools,
+                image=image,
+            )
+        )
 
-    async def _run_query_async(self, prompt: str, max_turns: int) -> str:
+    async def _run_query_async(
+        self,
+        prompt: str,
+        max_turns: int,
+        allowed_tools: list[str] | None = None,
+        image: bytes | None = None,
+    ) -> str:
         query, ClaudeAgentOptions, AssistantMessage, TextBlock, ResultMessage = _import_sdk_symbols(
             "query",
             "ClaudeAgentOptions",
@@ -126,10 +155,26 @@ class ClaudeAgentSDKBackend:
             system_prompt="Return precise output. If JSON is requested, return JSON only.",
             max_turns=max_turns,
             cwd=os.getcwd(),
+            **({"allowed_tools": allowed_tools} if allowed_tools else {}),
         )
+        if image is not None:
+            image_b64 = base64.b64encode(image).decode("ascii")
+            prompt_input: Any = [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": image_b64,
+                    },
+                },
+            ]
+        else:
+            prompt_input = prompt
         assistant_chunks: list[str] = []
         final_result: str | None = None
-        async for message in query(prompt=prompt, options=options):
+        async for message in query(prompt=prompt_input, options=options):
             if isinstance(message, AssistantMessage):
                 for block in message.content:
                     if isinstance(block, TextBlock):
@@ -163,6 +208,14 @@ class ClaudeAgentSDKBackend:
             "ResultMessage",
         )
 
+        # Track state from tool calls during the agent loop
+        agent_state: dict[str, Any] = {
+            "screenshot_saved": False,
+            "screenshot_path": None,
+            "metadata_extracted": False,
+            "metadata": None,
+        }
+
         @tool("screenshot", "Capture the current browser viewport", {})
         async def screenshot_tool(_args: dict[str, Any]) -> dict[str, Any]:
             image_b64 = base64.b64encode(tools.screenshot()).decode("ascii")
@@ -191,11 +244,16 @@ class ClaudeAgentSDKBackend:
         @tool("extract_metadata", "Extract metadata from the current page", {})
         async def extract_metadata_tool(_args: dict[str, Any]) -> dict[str, Any]:
             metadata = tools.extract_metadata()
+            agent_state["metadata_extracted"] = True
+            agent_state["metadata"] = metadata
             return {"content": [{"type": "text", "text": metadata.model_dump_json()}]}
 
         @tool("save_screenshot", "Save a final full-page screenshot", {"path": str})
         async def save_screenshot_tool(args: dict[str, Any]) -> dict[str, Any]:
-            result = tools.save_screenshot(str(args["path"]))
+            path = str(args["path"])
+            result = tools.save_screenshot(path)
+            agent_state["screenshot_saved"] = True
+            agent_state["screenshot_path"] = path
             return {"content": [{"type": "text", "text": json.dumps(result)}]}
 
         server = create_sdk_mcp_server(
@@ -226,25 +284,28 @@ class ClaudeAgentSDKBackend:
             allowed_tools=allowed_tools,
         )
         prompt = BROWSER_PROMPT.format(company_url=company.url)
-        assistant_chunks: list[str] = []
         async with ClaudeSDKClient(options=options) as client:
             await client.query(prompt)
             async for message in client.receive_response():
-                if isinstance(message, AssistantMessage):
-                    for block in message.content:
-                        if isinstance(block, TextBlock):
-                            assistant_chunks.append(block.text)
-                elif isinstance(message, ResultMessage) and message.is_error:
+                if isinstance(message, ResultMessage) and message.is_error:
                     raise RuntimeError(message.result or "browser agent failed")
 
-        metadata = tools.extract_metadata()
+        # If the agent didn't call save_screenshot, save one now as fallback
+        if not agent_state["screenshot_saved"]:
+            tools.save_screenshot("/app/screenshot.png")
+            agent_state["screenshot_path"] = "/app/screenshot.png"
+
+        # If the agent didn't call extract_metadata, extract now as fallback
+        if not agent_state["metadata_extracted"]:
+            agent_state["metadata"] = tools.extract_metadata()
+
         return BrowserArtifact(
             company=company,
             run_id="",
             status="success",
-            screenshot_path="/app/screenshot.png",
+            screenshot_path=agent_state["screenshot_path"],
             metadata_path="/app/metadata.json",
-            metadata=metadata,
+            metadata=agent_state["metadata"],
         )
 
 
