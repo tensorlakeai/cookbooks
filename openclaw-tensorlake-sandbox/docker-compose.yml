@@ -1,0 +1,12 @@
+services:
+  openclaw:
+    image: your-openclaw-image
+    environment:
+      TENSORLAKE_API_KEY: ${TENSORLAKE_API_KEY}
+      # Optional resource overrides (defaults shown)
+      # TENSORLAKE_SANDBOX_CPUS: "2.0"
+      # TENSORLAKE_SANDBOX_MEMORY_MB: "4000"
+      # TENSORLAKE_SANDBOX_TIMEOUT_SECS: "3600"
+    volumes:
+      - ./tensorlake-openclaw-shim:/usr/local/bin/tensorlake-openclaw-shim:ro
+      - ./openclaw.json:/app/openclaw.json:ro

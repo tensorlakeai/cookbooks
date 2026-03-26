@@ -1,0 +1,389 @@
+#!/usr/bin/env bash
+# tensorlake-openclaw-shim
+# Proxies OpenClaw SSH-backend invocations to a Tensorlake Sandbox via the HTTP API.
+#
+# Sub-commands (checked before any SSH-arg stripping):
+#   tensorlake-openclaw-shim put <remote-path>      # upload stdin → sandbox file
+#   tensorlake-openclaw-shim get <remote-path>      # download sandbox file → stdout
+#
+# Command execution (also handles SSH-style invocations transparently):
+#   tensorlake-openclaw-shim [ssh-flags] [user@host] <cmd…>
+#
+# Required environment:
+#   TENSORLAKE_API_KEY           Tensorlake API key
+#
+# Optional overrides:
+#   TENSORLAKE_SANDBOX_CPUS          CPU quota for new sandboxes        (default: 2.0)
+#   TENSORLAKE_SANDBOX_MEMORY_MB     Memory for new sandboxes in MiB   (default: 4000)
+#   TENSORLAKE_SANDBOX_TIMEOUT_SECS  Auto-terminate after N seconds     (default: 3600)
+#   OPENCLAW_AGENT_ID    Scopes the state file per agent       (default: "default")
+#
+# Installation:
+#   install -m 0755 tensorlake-openclaw-shim ~/.local/bin/tensorlake-openclaw-shim
+
+set -uo pipefail
+
+# ─── Constants ────────────────────────────────────────────────────────────────
+readonly TENSORLAKE_API_BASE="https://api.tensorlake.ai"
+: "${TENSORLAKE_SANDBOX_CPUS:=2.0}"
+: "${TENSORLAKE_SANDBOX_MEMORY_MB:=4000}"
+: "${TENSORLAKE_SANDBOX_TIMEOUT_SECS:=3600}"
+: "${OPENCLAW_AGENT_ID:=default}"
+readonly STATE_FILE="/tmp/tensorlake-openclaw-${OPENCLAW_AGENT_ID}"
+
+# ─── Auth guard ───────────────────────────────────────────────────────────────
+if [[ -z "${TENSORLAKE_API_KEY:-}" ]]; then
+    printf 'tensorlake-openclaw-shim: TENSORLAKE_API_KEY is not set\n' >&2
+    exit 1
+fi
+
+# ─── JSON / URL helpers ───────────────────────────────────────────────────────
+_JSON_TOOL=""
+if command -v python3 &>/dev/null; then
+    _JSON_TOOL="python3"
+elif command -v jq &>/dev/null; then
+    _JSON_TOOL="jq"
+else
+    printf 'tensorlake-openclaw-shim: neither python3 nor jq found; cannot parse API responses\n' >&2
+    exit 1
+fi
+
+# json_get <json-string> <top-level-key>
+# Prints the value (string or number) of a top-level key; empty if absent or null.
+json_get() {
+    local json="$1" key="$2"
+    if [[ "$_JSON_TOOL" == "python3" ]]; then
+        python3 - "$json" "$key" <<'PYEOF'
+import sys, json
+try:
+    d = json.loads(sys.argv[1])
+    v = d.get(sys.argv[2])
+    if v is not None:
+        print(v, end='')
+except Exception:
+    pass
+PYEOF
+    else
+        printf '%s' "$json" | jq -r --arg k "$key" '.[$k] // empty'
+    fi
+}
+
+# json_string <value>  →  JSON-encoded quoted string (including surrounding quotes)
+json_string() {
+    if [[ "$_JSON_TOOL" == "python3" ]]; then
+        python3 -c "import sys, json; print(json.dumps(sys.argv[1]))" "$1"
+    else
+        printf '%s' "$1" | jq -Rs '.'
+    fi
+}
+
+# url_encode_path <path>
+# Percent-encodes a path for use as a query-parameter value; '/' is preserved.
+url_encode_path() {
+    if [[ "$_JSON_TOOL" == "python3" ]]; then
+        python3 -c \
+            "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe='/'), end='')" \
+            "$1"
+    else
+        # jq-only fallback: encode characters that are illegal in query-string values
+        printf '%s' "$1" \
+            | sed 's/ /%20/g; s/?/%3F/g; s/&/%26/g; s/=/%3D/g; s/+/%2B/g; s/#/%23/g'
+    fi
+}
+
+# ─── Sandbox lifecycle ────────────────────────────────────────────────────────
+
+# sandbox_status <sandbox-id>  →  prints the current status string (lowercase)
+sandbox_status() {
+    local resp
+    resp=$(curl -s --max-time 30 \
+        -H "Authorization: Bearer ${TENSORLAKE_API_KEY}" \
+        "${TENSORLAKE_API_BASE}/sandboxes/$1" 2>/dev/null) || resp='{}'
+    json_get "$resp" "status"
+}
+
+# wait_for_running <sandbox-id>
+# Blocks until the sandbox reaches "running"; exits 1 on timeout (60 s).
+wait_for_running() {
+    local id="$1" st attempts=0
+    while [[ $attempts -lt 60 ]]; do
+        st=$(sandbox_status "$id")
+        if [[ "$st" == "running" ]]; then
+            return 0
+        elif [[ "$st" == "terminated" || "$st" == "failed" ]]; then
+            printf 'tensorlake-openclaw-shim: sandbox %s entered state "%s"\n' "$id" "$st" >&2
+            exit 1
+        fi
+        sleep 1
+        (( attempts++ )) || true
+    done
+    printf 'tensorlake-openclaw-shim: timed out waiting for sandbox %s to start\n' "$id" >&2
+    exit 1
+}
+
+# Prints the sandbox ID to stdout (all diagnostic messages go to stderr).
+# Idempotent: reuses a running/pending sandbox recorded in $STATE_FILE.
+get_or_create_sandbox() {
+    local sandbox_id=""
+
+    if [[ -f "$STATE_FILE" ]]; then
+        sandbox_id=$(cat "$STATE_FILE")
+        if [[ -n "$sandbox_id" ]]; then
+            local st
+            st=$(sandbox_status "$sandbox_id")
+            if [[ "$st" == "running" || "$st" == "pending" ]]; then
+                printf '%s' "$sandbox_id"
+                return 0
+            fi
+            printf '[tensorlake] sandbox %s is "%s" — creating a new one\n' \
+                "$sandbox_id" "${st:-unreachable}" >&2
+        fi
+    fi
+
+    printf '[tensorlake] creating sandbox (cpus=%s, memory_mb=%s)…\n' \
+        "$TENSORLAKE_SANDBOX_CPUS" "$TENSORLAKE_SANDBOX_MEMORY_MB" >&2
+
+    local create_resp
+    create_resp=$(curl -s --max-time 30 \
+        -X POST \
+        -H "Authorization: Bearer ${TENSORLAKE_API_KEY}" \
+        -H "Content-Type: application/json" \
+        -d "{\"resources\": {\"cpus\": ${TENSORLAKE_SANDBOX_CPUS}, \"memory_mb\": ${TENSORLAKE_SANDBOX_MEMORY_MB}}, \"timeout_secs\": ${TENSORLAKE_SANDBOX_TIMEOUT_SECS}}" \
+        "${TENSORLAKE_API_BASE}/sandboxes")
+
+    sandbox_id=$(json_get "$create_resp" "sandbox_id")
+    if [[ -z "$sandbox_id" ]]; then
+        printf 'tensorlake-openclaw-shim: failed to create sandbox\nResponse: %s\n' \
+            "$create_resp" >&2
+        exit 1
+    fi
+
+    printf '%s' "$sandbox_id" > "$STATE_FILE"
+    printf '[tensorlake] sandbox %s created, waiting for running…\n' "$sandbox_id" >&2
+    wait_for_running "$sandbox_id"
+    printf '[tensorlake] sandbox ready: %s\n' "$sandbox_id" >&2
+    printf '%s' "$sandbox_id"
+}
+
+# terminate is handled before sandbox acquisition — no need to spin one up.
+if [[ "${1:-}" == "terminate" ]]; then
+    if [[ ! -f "$STATE_FILE" ]]; then
+        printf '[tensorlake] no active sandbox for agent "%s"\n' "$OPENCLAW_AGENT_ID" >&2
+        exit 0
+    fi
+    _sandbox_id=$(cat "$STATE_FILE")
+    printf '[tensorlake] terminating sandbox %s…\n' "$_sandbox_id" >&2
+    curl -s --max-time 30 \
+        -X DELETE \
+        -H "Authorization: Bearer ${TENSORLAKE_API_KEY}" \
+        "${TENSORLAKE_API_BASE}/sandboxes/${_sandbox_id}" >/dev/null
+    rm -f "$STATE_FILE"
+    printf '[tensorlake] sandbox terminated\n' >&2
+    exit 0
+fi
+
+# Acquire (or create) sandbox on every invocation — fast when already running.
+SANDBOX_ID=$(get_or_create_sandbox)
+SANDBOX_URL="https://${SANDBOX_ID}.sandbox.tensorlake.ai"
+
+# ─── put — upload stdin to a sandbox file ────────────────────────────────────
+cmd_put() {
+    local remote_path="$1"
+    [[ -n "$remote_path" ]] || {
+        printf 'tensorlake-openclaw-shim: put requires a <remote-path>\n' >&2; exit 1
+    }
+    local encoded
+    encoded=$(url_encode_path "$remote_path")
+    curl -sf --max-time 30 \
+        -X PUT \
+        -H "Authorization: Bearer ${TENSORLAKE_API_KEY}" \
+        -H "Content-Type: application/octet-stream" \
+        --data-binary @- \
+        "${SANDBOX_URL}/api/v1/files?path=${encoded}"
+}
+
+# ─── get — download a sandbox file to stdout ─────────────────────────────────
+cmd_get() {
+    local remote_path="$1"
+    [[ -n "$remote_path" ]] || {
+        printf 'tensorlake-openclaw-shim: get requires a <remote-path>\n' >&2; exit 1
+    }
+    local encoded
+    encoded=$(url_encode_path "$remote_path")
+    curl -sf --max-time 30 \
+        -H "Authorization: Bearer ${TENSORLAKE_API_KEY}" \
+        "${SANDBOX_URL}/api/v1/files?path=${encoded}"
+}
+
+# ─── exec — run a command in the sandbox ─────────────────────────────────────
+# Streams stdout/stderr in real time via the SSE follow endpoint, then exits
+# with the remote process's exit code.
+cmd_exec() {
+    local cmd_str="$*"
+    [[ -n "$cmd_str" ]] || {
+        printf 'tensorlake-openclaw-shim: no command supplied\n' >&2; exit 1
+    }
+
+    # ── Session-end detection ─────────────────────────────────────────────────
+    # OpenClaw's SSH removeRuntime calls `rm -rf` with the marker argument
+    # "openclaw-sandbox-remove" as $0.  This is the last command of a session,
+    # so we terminate the sandbox after it completes.
+    local _is_session_end=false
+    [[ "$cmd_str" == *'openclaw-sandbox-remove'* ]] && _is_session_end=true
+
+    # ── Stdin forwarding ──────────────────────────────────────────────────────
+    # OpenClaw pipes a tar archive to the shim's stdin for workspace uploads.
+    # The Tensorlake process API has no stdin channel, so we detect this case
+    # by checking whether the command reads from stdin (contains "tar -xf -"),
+    # upload the bytes to a temp file in the sandbox, and rewrite the command
+    # to redirect from it.  We must not use a TTY check ([[ ! -t 0 ]]) here
+    # because OpenClaw always spawns the shim with stdio:pipe — even for
+    # commands that send no data — so a TTY check would hang on every call.
+    if [[ "$cmd_str" == *'tar -xf -'* ]]; then
+        local stdin_file="/tmp/.shim-stdin-$$"
+        cmd_put "$stdin_file"   # reads shim's stdin → uploads to sandbox
+        # Replace the stdin marker "-" with the temp file path, then clean up
+        cmd_str="${cmd_str/tar -xf -/tar -xf ${stdin_file}}; rm -f ${stdin_file}"
+    fi
+
+    # JSON-encode the command string for the request body
+    local cmd_json
+    cmd_json=$(json_string "$cmd_str")
+
+    # Launch the remote process
+    local start_resp pid
+    start_resp=$(curl -s --max-time 30 \
+        -X POST \
+        -H "Authorization: Bearer ${TENSORLAKE_API_KEY}" \
+        -H "Content-Type: application/json" \
+        -d "{\"command\": \"bash\", \"args\": [\"-c\", ${cmd_json}]}" \
+        "${SANDBOX_URL}/api/v1/processes")
+
+    pid=$(json_get "$start_resp" "pid")
+    if [[ -z "$pid" ]]; then
+        printf 'tensorlake-openclaw-shim: failed to start process\nResponse: %s\n' \
+            "$start_resp" >&2
+        exit 1
+    fi
+
+    # ── Stream stdout/stderr via SSE follow endpoint ──────────────────────────
+    # Protocol: blank-line-delimited SSE events.
+    # Only events with `event: output` carry output data.
+    # Data payload: {"line":"...","stream":"stdout|stderr"}
+    local cur_event=""
+    while IFS= read -r sse_line; do
+        if [[ "$sse_line" == "event: "* ]]; then
+            cur_event="${sse_line#event: }"
+        elif [[ "$sse_line" == "data: "* ]]; then
+            if [[ "$cur_event" == "output" ]]; then
+                local data="${sse_line#data: }"
+                [[ -z "$data" || "$data" == "[DONE]" ]] && continue
+                local stream line_content
+                stream=$(json_get "$data" "stream")
+                line_content=$(json_get "$data" "line")
+                if [[ "$stream" == "stderr" ]]; then
+                    printf '%s' "$line_content" >&2
+                else
+                    printf '%s' "$line_content"
+                fi
+            fi
+        elif [[ -z "$sse_line" ]]; then
+            cur_event=""   # blank line terminates an SSE event block
+        fi
+    done < <(curl -sS --no-buffer --max-time 300 \
+        -H "Authorization: Bearer ${TENSORLAKE_API_KEY}" \
+        "${SANDBOX_URL}/api/v1/processes/${pid}/output/follow" 2>/dev/null) || true
+
+    # ── Poll for exit code ────────────────────────────────────────────────────
+    # The follow stream ends when the process exits; we then fetch the exit code.
+    local exit_code=0 attempts=0 proc_status poll_resp raw_exit
+    while [[ $attempts -lt 60 ]]; do
+        poll_resp=$(curl -sf --max-time 30 \
+            -H "Authorization: Bearer ${TENSORLAKE_API_KEY}" \
+            "${SANDBOX_URL}/api/v1/processes/${pid}" 2>/dev/null) || poll_resp='{}'
+        proc_status=$(json_get "$poll_resp" "status")
+        if [[ "$proc_status" == "exited" ]]; then
+            raw_exit=$(json_get "$poll_resp" "exit_code")
+            exit_code=$(( ${raw_exit:-0} ))
+            break
+        fi
+        sleep 0.5
+        (( attempts++ )) || true
+    done
+
+    # ── Auto-terminate on session end ─────────────────────────────────────────
+    if $_is_session_end; then
+        printf '[tensorlake] session ended — terminating sandbox %s\n' "$SANDBOX_ID" >&2
+        curl -s --max-time 30 \
+            -X DELETE \
+            -H "Authorization: Bearer ${TENSORLAKE_API_KEY}" \
+            "${TENSORLAKE_API_BASE}/sandboxes/${SANDBOX_ID}" >/dev/null
+        rm -f "$STATE_FILE"
+        printf '[tensorlake] sandbox terminated\n' >&2
+    fi
+
+    exit "$exit_code"
+}
+
+# ─── SSH argument stripping ───────────────────────────────────────────────────
+# OpenClaw invokes the shim as:
+#   tensorlake-openclaw-shim -F <cfg> -T -o RequestTTY=no openclaw-sandbox "<cmd>"
+#
+# The SSH host alias ("openclaw-sandbox") has no "@", so we can't rely on
+# the *@* pattern to detect it.  Instead: when SSH flags are present the
+# first non-flag token is always the hostname and the rest is the command.
+# When there are no flags (direct invocation) all tokens form the command.
+parse_ssh_command() {
+    local skip_next=false has_flags=false
+    local -a non_flags=()
+
+    for arg in "$@"; do
+        if $skip_next; then
+            skip_next=false
+            continue
+        fi
+        case "$arg" in
+            # SSH flags that consume the following argument as their value
+            -[bcDEeFIiJjlLmopQRSWw])
+                skip_next=true; has_flags=true ;;
+            # Boolean SSH flags
+            -[46AaCfGgKkMNnqsTtVvXxYy]*)
+                has_flags=true ;;
+            *)
+                non_flags+=("$arg") ;;
+        esac
+    done
+
+    local IFS=' '
+    if $has_flags && [[ ${#non_flags[@]} -ge 2 ]]; then
+        # SSH-style: non_flags[0] is hostname, non_flags[1:] is the command
+        printf '%s' "${non_flags[*]:1}"
+    elif [[ ${#non_flags[@]} -ge 1 ]]; then
+        # Direct invocation: all tokens are the command
+        printf '%s' "${non_flags[*]}"
+    fi
+}
+
+# ─── Dispatch ─────────────────────────────────────────────────────────────────
+case "${1:-}" in
+    put)
+        shift
+        cmd_put "${1:-}"
+        ;;
+    get)
+        shift
+        cmd_get "${1:-}"
+        ;;
+    "")
+        printf 'Usage: %s put <path> | get <path> | terminate | [ssh-opts] [user@host] <cmd…>\n' "$0" >&2
+        exit 1
+        ;;
+    *)
+        _cmd=$(parse_ssh_command "$@")
+        if [[ -z "$_cmd" ]]; then
+            printf 'tensorlake-openclaw-shim: could not extract a command from args: %s\n' "$*" >&2
+            exit 1
+        fi
+        cmd_exec "$_cmd"
+        ;;
+esac
