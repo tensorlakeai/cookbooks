@@ -38,10 +38,51 @@ tail -100 /tmp/playwright-install.log
 @function()
 def competitive_analyst(domain: str, count: int) -> dict:
     companies = research_agent.future(domain, count)
-    raw_artifacts = browser_agent.map(companies)
+    snapshot_id = ensure_browser_snapshot.future()
+    browser_tasks = prepare_browser_tasks.future(companies, snapshot_id)
+    raw_artifacts = browser_agent.map(browser_tasks)
     successful_artifacts = filter_successful.future(raw_artifacts)
     scorecards = analysis_agent.map(successful_artifacts)
     return report_agent.future(domain, count, companies, raw_artifacts, scorecards)
+
+
+@function(timeout=600, secrets=["TENSORLAKE_API_KEY"])
+def ensure_browser_snapshot() -> str:
+    """Return a sandbox snapshot ID with Playwright pre-installed.
+
+    If BROWSER_SANDBOX_SNAPSHOT_ID is already set, return it immediately.
+    Otherwise, create a fresh sandbox, install Playwright + Chromium,
+    snapshot it, and return the new snapshot ID.
+    """
+    existing = os.getenv("BROWSER_SANDBOX_SNAPSHOT_ID")
+    if existing:
+        print(f"Using existing browser snapshot: {existing}")
+        return existing
+
+    print("No browser snapshot found — creating one with Playwright + Chromium...")
+    client = SandboxClient.for_cloud()
+    with client.create_and_connect(
+        image="python:3.11-slim",
+        allow_internet_access=True,
+        timeout_secs=600,
+        startup_timeout=120,
+    ) as sandbox:
+        result = sandbox.run(
+            "sh",
+            args=["-lc", "pip install playwright && playwright install --with-deps chromium"],
+            timeout=300,
+        )
+        if result.exit_code != 0:
+            raise RuntimeError(f"Failed to install browser runtime: {result.stderr or result.stdout}")
+        snapshot = client.snapshot_and_wait(sandbox.id, timeout=300)
+        print(f"Created browser snapshot: {snapshot.snapshot_id}")
+        return snapshot.snapshot_id
+
+
+@function()
+def prepare_browser_tasks(companies: list[dict], snapshot_id: str) -> list[dict]:
+    """Bundle each company with the shared snapshot ID for browser_agent.map()."""
+    return [{"company": c, "snapshot_id": snapshot_id} for c in companies]
 
 
 @function(timeout=120, secrets=["ANTHROPIC_API_KEY"], retries=Retries(max_retries=1))
@@ -57,9 +98,15 @@ def research_agent(domain: str, count: int) -> list[dict]:
     secrets=["ANTHROPIC_API_KEY", "TENSORLAKE_API_KEY"],
     retries=Retries(max_retries=2),
 )
-def browser_agent(company: dict) -> dict:
+def browser_agent(task: dict) -> dict:
+    """Browse a single company's homepage inside a sandboxed Playwright session.
+
+    Args:
+        task: {"company": <Company dict>, "snapshot_id": <str>}
+    """
     backend = get_agent_backend()
-    validated_company = Company.model_validate(company)
+    validated_company = Company.model_validate(task["company"])
+    snapshot_id = task["snapshot_id"]
     company_id = validated_company.id
     run_id = make_run_id(company_id, suffix=os.urandom(4).hex())
     artifact_dir = Path("/tmp/artifacts") / run_id
@@ -70,7 +117,7 @@ def browser_agent(company: dict) -> dict:
     client = SandboxClient.for_cloud()
     try:
         with client.create_and_connect(
-            snapshot_id=os.getenv("BROWSER_SANDBOX_SNAPSHOT_ID"),
+            snapshot_id=snapshot_id,
             allow_internet_access=True,
             timeout_secs=180,
             startup_timeout=180,
