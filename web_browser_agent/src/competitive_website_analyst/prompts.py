@@ -12,7 +12,7 @@ Instructions:
 - If you see a cookie or consent popup, try to dismiss it
 - If you see a loading spinner or skeleton state, wait and check again
 - If you see an interstitial or signup wall, try to dismiss it
-- Once the page looks clean, save a final full-page screenshot
+- Once the page looks clean, save a final screenshot to /app/screenshot.png
 - Extract page metadata
 - If the site is unreachable or broken, report failure
 - Do not click through to other pages or submit forms

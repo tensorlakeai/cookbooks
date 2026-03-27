@@ -306,7 +306,7 @@ class ClaudeAgentSDKBackend:
 
         @tool("save_screenshot", "Save a final viewport screenshot", {"path": str})
         async def save_screenshot_tool(args: dict[str, Any]) -> dict[str, Any]:
-            path = str(args["path"])
+            path = "/app/screenshot.png"  # always use canonical path regardless of agent choice
             result = tools.save_screenshot(path)
             agent_state["screenshot_saved"] = True
             agent_state["screenshot_path"] = path
