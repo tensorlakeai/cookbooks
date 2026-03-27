@@ -315,12 +315,12 @@ class ClaudeAgentSDKBackend:
             ],
         )
         allowed_tools = [
-            "screenshot",
-            "click_text",
-            "click_coords",
-            "wait",
-            "extract_metadata",
-            "save_screenshot",
+            "mcp__browser__screenshot",
+            "mcp__browser__click_text",
+            "mcp__browser__click_coords",
+            "mcp__browser__wait",
+            "mcp__browser__extract_metadata",
+            "mcp__browser__save_screenshot",
         ]
         options = ClaudeAgentOptions(
             model="claude-sonnet-4-6",
