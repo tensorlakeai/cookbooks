@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
+import platform
+import subprocess
 import time
 from pathlib import Path
 
@@ -12,7 +15,7 @@ from competitive_website_analyst.agent_backend import get_agent_backend
 from competitive_website_analyst.browser_failures import classify_browser_failure_stage, is_retryable
 from competitive_website_analyst.browser_runtime import SANDBOX_BROWSER_SERVER, SANDBOX_RPC_CLIENT, SandboxBrowserTools
 from competitive_website_analyst.models import BrowserArtifact, Company, FailureRecord, ReportBundle, Scorecard
-from competitive_website_analyst.scoring import build_empty_report_bundle, build_summary_csv, compute_overall_score, sort_scorecards
+from competitive_website_analyst.scoring import build_empty_report_bundle, build_html_report, build_summary_csv, compute_overall_score, sort_scorecards
 from competitive_website_analyst.utils import make_run_id, parse_json, validate_companies
 
 
@@ -114,9 +117,24 @@ def competitive_analyst(domain: str, count: int) -> dict:
     print(f"\n[report] Generating final competitive analysis report...")
     result = report_agent(domain, count, all_companies, all_artifacts, scorecards)
     print(f"[report] Done — {result.get('successful_count', 0)} companies in final report")
-    print(f"\n{'='*60}")
-    print(f"  Run complete")
-    print(f"{'='*60}\n")
+
+    # Save HTML report locally and open in browser
+    html_report = result.get("html_report", "")
+    if html_report:
+        report_dir = Path("output")
+        report_dir.mkdir(parents=True, exist_ok=True)
+        html_path = (report_dir / "report.html").resolve()
+        html_path.write_text(html_report)
+        print(f"\n{'='*60}")
+        print(f"  Run complete")
+        print(f"  Report: {html_path}")
+        print(f"{'='*60}\n")
+        _open_in_browser(str(html_path))
+    else:
+        print(f"\n{'='*60}")
+        print(f"  Run complete (no HTML report generated)")
+        print(f"{'='*60}\n")
+
     return result
 
 
@@ -254,7 +272,7 @@ def _run_browser_session(
             startup_timeout=180,
         ) as sandbox:
             proc = None
-            tools = SandboxBrowserTools(sandbox=sandbox)
+            tools = SandboxBrowserTools(sandbox=sandbox, save_dir=str(artifact_dir))
             try:
                 _ensure_browser_runtime(sandbox)
                 sandbox.write_file("/app/browser_server.py", SANDBOX_BROWSER_SERVER.encode("utf-8"))
@@ -364,6 +382,27 @@ def report_agent(
           f"({len(failures)} failures)...")
     backend = get_agent_backend()
     report_markdown = backend.report(validated_scorecards)
+
+    # Load screenshots for the HTML report
+    screenshots: dict[str, str] = {}
+    for artifact in raw_artifacts:
+        if artifact.get("status") == "success" and artifact.get("screenshot_path"):
+            company_name = artifact["company"]["name"]
+            try:
+                png_bytes = open(artifact["screenshot_path"], "rb").read()
+                screenshots[company_name] = base64.b64encode(png_bytes).decode("ascii")
+            except OSError:
+                pass
+
+    html_report = build_html_report(
+        domain=domain,
+        scorecards=validated_scorecards,
+        failures=failures,
+        screenshots=screenshots,
+        markdown_report=report_markdown,
+    )
+    print(f"[report] HTML report generated ({len(html_report):,} chars)")
+
     bundle = ReportBundle(
         domain=domain,
         requested_count=requested_count,
@@ -373,6 +412,7 @@ def report_agent(
         failures=failures,
         scorecards=validated_scorecards,
         markdown_report=report_markdown,
+        html_report=html_report,
         summary_csv=build_summary_csv(validated_scorecards),
     )
     print(f"[report] Report ready — {len(validated_scorecards)} scorecards, "
@@ -429,6 +469,19 @@ def _collect_browser_diagnostics(sandbox: object, proc: object | None, artifact_
     return diagnostics
 
 
+def _open_in_browser(path: str) -> None:
+    """Open a file in the default browser. Best-effort, never raises."""
+    try:
+        system = platform.system()
+        if system == "Darwin":
+            subprocess.Popen(["open", path])
+        elif system == "Linux":
+            subprocess.Popen(["xdg-open", path])
+        elif system == "Windows":
+            os.startfile(path)
+        print(f"[report] Opened in browser: {path}")
+    except Exception:
+        print(f"[report] Could not auto-open. Open manually: {path}")
 
 
 if __name__ == "__main__":

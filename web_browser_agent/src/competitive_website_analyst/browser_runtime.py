@@ -146,10 +146,18 @@ with urllib.request.urlopen(request, timeout=15) as response:
 class SandboxBrowserTools:
     sandbox: object
     port: int = 8765
+    save_dir: str | None = None
+    _screenshot_count: int = 0
 
     def screenshot(self) -> bytes:
         payload = self._rpc("screenshot")
-        return base64.b64decode(payload["image_b64"])
+        png_bytes = base64.b64decode(payload["image_b64"])
+        if self.save_dir:
+            object.__setattr__(self, "_screenshot_count", self._screenshot_count + 1)
+            step_path = f"{self.save_dir}/step_{self._screenshot_count:02d}.png"
+            open(step_path, "wb").write(png_bytes)
+            print(f"  [screenshot] Saved step {self._screenshot_count}: {step_path}")
+        return png_bytes
 
     def click_text(self, text: str) -> dict:
         return self._rpc("click_text", {"text": text})
@@ -164,7 +172,18 @@ class SandboxBrowserTools:
         return BrowserMetadata.model_validate(self._rpc("extract_metadata"))
 
     def save_screenshot(self, path: str) -> dict:
-        return self._rpc("save_screenshot", {"path": path})
+        result = self._rpc("save_screenshot", {"path": path})
+        if self.save_dir:
+            object.__setattr__(self, "_screenshot_count", self._screenshot_count + 1)
+            step_path = f"{self.save_dir}/step_{self._screenshot_count:02d}_final.png"
+            # Pull the full-page screenshot from the sandbox too
+            try:
+                full_page_bytes = self.sandbox.read_file(path)
+                open(step_path, "wb").write(full_page_bytes)
+                print(f"  [screenshot] Saved final full-page: {step_path}")
+            except Exception:
+                pass
+        return result
 
     def shutdown(self) -> dict:
         return self._rpc("shutdown")

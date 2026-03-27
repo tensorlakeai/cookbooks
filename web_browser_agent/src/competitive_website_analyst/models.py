@@ -155,6 +155,7 @@ class ReportBundle(ModelMixin):
     failures: list[FailureRecord | dict[str, Any]] = field(default_factory=list)
     scorecards: list[Scorecard | dict[str, Any]] = field(default_factory=list)
     markdown_report: str = ""
+    html_report: str = ""
     summary_csv: str = ""
 
     def __post_init__(self) -> None:
