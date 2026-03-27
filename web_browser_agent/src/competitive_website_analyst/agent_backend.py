@@ -172,6 +172,7 @@ class ClaudeAgentSDKBackend:
             ]
         else:
             prompt_input = prompt
+        ToolUseBlock, = _import_sdk_symbols("ToolUseBlock")
         assistant_chunks: list[str] = []
         final_result: str | None = None
         async for message in query(prompt=prompt_input, options=options):
@@ -179,6 +180,10 @@ class ClaudeAgentSDKBackend:
                 for block in message.content:
                     if isinstance(block, TextBlock):
                         assistant_chunks.append(block.text)
+                        if block.text.strip():
+                            print(f"    [agent] {block.text.strip()[:200]}")
+                    elif isinstance(block, ToolUseBlock):
+                        print(f"    [agent] tool: {block.name}({json.dumps(block.input)[:120]})")
             elif isinstance(message, ResultMessage) and message.result:
                 final_result = message.result
         text = final_result or "\n".join(part for part in assistant_chunks if part.strip())
@@ -283,12 +288,21 @@ class ClaudeAgentSDKBackend:
             mcp_servers={"browser": server},
             allowed_tools=allowed_tools,
         )
+        ToolUseBlock, = _import_sdk_symbols("ToolUseBlock")
         prompt = BROWSER_PROMPT.format(company_url=company.url)
+        print(f"    [agent] Starting browser agent for {company.url}")
         async with ClaudeSDKClient(options=options) as client:
             await client.query(prompt)
             async for message in client.receive_response():
-                if isinstance(message, ResultMessage) and message.is_error:
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, TextBlock) and block.text.strip():
+                            print(f"    [agent] {block.text.strip()[:200]}")
+                        elif isinstance(block, ToolUseBlock):
+                            print(f"    [agent] tool: {block.name}({json.dumps(block.input)[:120]})")
+                elif isinstance(message, ResultMessage) and message.is_error:
                     raise RuntimeError(message.result or "browser agent failed")
+        print(f"    [agent] Browser agent loop complete")
 
         # If the agent didn't call save_screenshot, save one now as fallback
         if not agent_state["screenshot_saved"]:

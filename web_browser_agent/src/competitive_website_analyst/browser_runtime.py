@@ -15,8 +15,6 @@ import json
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from playwright.sync_api import sync_playwright
-
 
 def extract_metadata(page):
     return page.evaluate(
@@ -67,12 +65,18 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class BrowserServer(HTTPServer):
-    def __init__(self, addr, handler, page, started_at):
+    def __init__(self, addr, handler):
         super().__init__(addr, handler)
-        self.page = page
-        self.started_at = started_at
+        self.page = None
+        self.started_at = time.time()
+        self.ready = False
+        self.launch_error = None
 
     def handle_tool(self, tool, args):
+        if tool == "ping":
+            return {"ok": True, "ready": self.ready, "error": self.launch_error}
+        if not self.ready:
+            return {"ok": False, "error": self.launch_error or "browser not ready yet"}
         if tool == "screenshot":
             png = self.page.screenshot(type="png")
             return {"image_b64": base64.b64encode(png).decode("ascii")}
@@ -100,22 +104,46 @@ class BrowserServer(HTTPServer):
 
 
 def main():
+    import threading
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", required=True)
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
 
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
-        page = browser.new_page(viewport={"width": 1280, "height": 800})
-        started_at = time.time()
-        page.goto(args.url, wait_until="networkidle", timeout=45000)
-        server = BrowserServer(("127.0.0.1", args.port), Handler, page, started_at)
+    # Start the HTTP server FIRST so health checks always get a response
+    server = BrowserServer(("127.0.0.1", args.port), Handler)
+    print(f"Browser server listening on port {args.port}", flush=True)
+
+    # Launch browser + navigate in a background thread
+    def launch_browser():
         try:
-            while True:
-                server.handle_request()
-        finally:
-            browser.close()
+            from playwright.sync_api import sync_playwright
+            pw = sync_playwright().start()
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 800})
+            try:
+                page.goto(args.url, wait_until="networkidle", timeout=60000)
+            except Exception as e:
+                print(f"Navigation warning (page may be partial): {e}", flush=True)
+            server.page = page
+            server.ready = True
+            print(f"Browser ready for {args.url}", flush=True)
+        except Exception as e:
+            server.launch_error = str(e)
+            print(f"Browser launch failed: {e}", flush=True)
+
+    threading.Thread(target=launch_browser, daemon=True).start()
+
+    try:
+        while True:
+            server.handle_request()
+    finally:
+        if server.page:
+            try:
+                server.page.context.browser.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
@@ -190,7 +218,7 @@ class SandboxBrowserTools:
 
     def _rpc(self, tool: str, args: dict | None = None) -> dict:
         result = self.sandbox.run(
-            "python",
+            "python3",
             args=["/app/browser_rpc.py", tool, json.dumps(args or {})],
             timeout=20,
         )

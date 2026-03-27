@@ -25,11 +25,11 @@ browser_image = Image(base_image="python:3.11-slim").run(
 
 BROWSER_SERVER_BOOTSTRAP = """\
 set -e
-if ! python -c "import playwright" >/dev/null 2>&1; then
-  python -m pip install --break-system-packages playwright >/tmp/pip-playwright.log 2>&1
+if ! python3 -c "import playwright" >/dev/null 2>&1; then
+  python3 -m pip install --break-system-packages playwright >/tmp/pip-playwright.log 2>&1
   tail -100 /tmp/pip-playwright.log
 fi
-python -m playwright install --with-deps chromium >/tmp/playwright-install.log 2>&1 || {
+python3 -m playwright install --with-deps chromium >/tmp/playwright-install.log 2>&1 || {
   cat /tmp/playwright-install.log
   exit 1
 }
@@ -151,6 +151,11 @@ def ensure_browser_snapshot() -> str:
         print(f"Using existing browser snapshot: {existing}")
         return existing
 
+    if not os.getenv("TENSORLAKE_API_KEY"):
+        raise RuntimeError(
+            "TENSORLAKE_API_KEY is required to create browser sandboxes. "
+            "Set it with: export TENSORLAKE_API_KEY=<your-key>"
+        )
     print("No browser snapshot found — creating one with Playwright + Chromium...")
     client = SandboxClient.for_cloud()
     with client.create_and_connect(
@@ -159,15 +164,40 @@ def ensure_browser_snapshot() -> str:
         timeout_secs=600,
         startup_timeout=120,
     ) as sandbox:
+        # Step 1: Install playwright pip package
+        print("[setup] Installing playwright pip package...")
+        result = sandbox.run(
+            "python3",
+            args=["-m", "pip", "install", "--break-system-packages", "playwright"],
+            timeout=120,
+        )
+        if result.exit_code != 0:
+            raise RuntimeError(f"pip install playwright failed: {result.stderr or result.stdout}")
+
+        # Step 2: Install Chromium browser (redirect output to file to avoid EPIPE)
+        print("[setup] Installing Chromium (this may take a minute)...")
         result = sandbox.run(
             "sh",
-            args=["-lc", "pip install playwright && playwright install --with-deps chromium"],
+            args=["-c", "python3 -m playwright install --with-deps chromium > /tmp/pw-install.log 2>&1"],
             timeout=300,
         )
         if result.exit_code != 0:
-            raise RuntimeError(f"Failed to install browser runtime: {result.stderr or result.stdout}")
-        snapshot = client.snapshot_and_wait(sandbox.id, timeout=300)
-        print(f"Created browser snapshot: {snapshot.snapshot_id}")
+            # Read the log for diagnostics
+            try:
+                log = sandbox.read_file("/tmp/pw-install.log").decode("utf-8", errors="replace")[-3000:]
+            except Exception:
+                log = result.stderr or result.stdout or "no output"
+            raise RuntimeError(f"playwright install chromium failed: {log}")
+
+        # Verify install before snapshotting
+        verify = sandbox.run("python3", args=["-c", "import playwright; print(playwright.__file__)"], timeout=15)
+        print(f"[setup] Playwright verify: exit={verify.exit_code} stdout={verify.stdout.strip()}")
+        if verify.exit_code != 0:
+            raise RuntimeError(f"Playwright install verification failed: {verify.stderr}")
+
+        print("[setup] Browser runtime installed, creating snapshot...")
+        snapshot = client.snapshot_and_wait(sandbox.sandbox_id, timeout=300)
+        print(f"[setup] Created browser snapshot: {snapshot.snapshot_id} (status: {snapshot.status})")
         return snapshot.snapshot_id
 
 
@@ -198,9 +228,8 @@ MAX_BROWSER_ATTEMPTS = 3
 def browser_agent(task: dict) -> dict:
     """Browse a single company's homepage inside a sandboxed Playwright session.
 
-    Retries internally up to MAX_BROWSER_ATTEMPTS for retryable failures
-    (timeout, browser crash, sandbox issues). Non-retryable failures
-    (DNS errors, CAPTCHA blocks) fail immediately.
+    Creates one sandbox and retries the browser server + agent loop inside it
+    up to MAX_BROWSER_ATTEMPTS times for retryable failures.
 
     Args:
         task: {"company": <Company dict>, "snapshot_id": <str>}
@@ -209,128 +238,152 @@ def browser_agent(task: dict) -> dict:
     validated_company = Company.model_validate(task["company"])
     snapshot_id = task["snapshot_id"]
     company_id = validated_company.id
+    run_id = make_run_id(company_id, suffix=os.urandom(4).hex())
+    artifact_dir = Path("/tmp/artifacts") / run_id
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    screenshot_path = artifact_dir / "screenshot.png"
+    metadata_path = artifact_dir / "metadata.json"
 
     print(f"[browser:{company_id}] Starting — {validated_company.name} ({validated_company.url})")
-    last_failure: BrowserArtifact | None = None
+    print(f"[browser:{company_id}] Using snapshot: {snapshot_id}")
 
-    for attempt in range(MAX_BROWSER_ATTEMPTS):
-        run_id = make_run_id(company_id, suffix=os.urandom(4).hex())
-        artifact_dir = Path("/tmp/artifacts") / run_id
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        screenshot_path = artifact_dir / "screenshot.png"
-        metadata_path = artifact_dir / "metadata.json"
-
-        if attempt > 0:
-            print(f"[browser:{company_id}] Attempt {attempt + 1}/{MAX_BROWSER_ATTEMPTS}...")
-
-        print(f"[browser:{company_id}] Creating sandbox and navigating to {validated_company.url}")
-        result = _run_browser_session(
-            backend=backend,
-            company=validated_company,
-            snapshot_id=snapshot_id,
-            run_id=run_id,
-            artifact_dir=artifact_dir,
-            screenshot_path=screenshot_path,
-            metadata_path=metadata_path,
-        )
-
-        if result.status == "success":
-            title = result.metadata.title if result.metadata else "?"
-            print(f"[browser:{company_id}] Success — page title: {title!r}")
-            return result.model_dump(mode="json")
-
-        last_failure = result
-        stage = result.failure_stage or "browser_execution"
-
-        if not is_retryable(stage):
-            print(f"[browser:{company_id}] Non-retryable failure ({stage}): {result.failure_reason}")
-            return result.model_dump(mode="json")
-
-        if attempt < MAX_BROWSER_ATTEMPTS - 1:
-            print(f"[browser:{company_id}] Attempt {attempt + 1} failed ({stage}), retrying...")
-
-    print(f"[browser:{company_id}] All {MAX_BROWSER_ATTEMPTS} attempts exhausted")
-    return last_failure.model_dump(mode="json")
-
-
-def _run_browser_session(
-    backend: object,
-    company: Company,
-    snapshot_id: str,
-    run_id: str,
-    artifact_dir: Path,
-    screenshot_path: Path,
-    metadata_path: Path,
-) -> BrowserArtifact:
-    """Single browser attempt. Returns a BrowserArtifact (success or failed), never raises."""
+    # Create sandbox once, retry inside it
     client = SandboxClient.for_cloud()
     try:
         with client.create_and_connect(
             snapshot_id=snapshot_id,
             allow_internet_access=True,
-            timeout_secs=180,
+            timeout_secs=300,
             startup_timeout=180,
         ) as sandbox:
-            proc = None
-            tools = SandboxBrowserTools(sandbox=sandbox, save_dir=str(artifact_dir))
-            try:
-                _ensure_browser_runtime(sandbox)
-                sandbox.write_file("/app/browser_server.py", SANDBOX_BROWSER_SERVER.encode("utf-8"))
-                sandbox.write_file("/app/browser_rpc.py", SANDBOX_RPC_CLIENT.encode("utf-8"))
-                proc = sandbox.start_process(
-                    "python",
-                    args=["/app/browser_server.py", "--url", str(company.url)],
-                    stdout_mode=OutputMode.CAPTURE,
-                    stderr_mode=OutputMode.CAPTURE,
-                )
-                _wait_for_browser_server(tools)
-                artifact = backend.drive_browser(company=company, tools=tools)
-                screenshot_bytes = sandbox.read_file("/app/screenshot.png")
-                if artifact.metadata is None:
-                    raise ValueError("browser agent returned no metadata")
-                metadata_bytes = json.dumps(artifact.metadata.model_dump(mode="json")).encode("utf-8")
-                screenshot_path.write_bytes(screenshot_bytes)
-                metadata_path.write_bytes(metadata_bytes)
-                return BrowserArtifact(
-                    company=company,
+            print(f"[browser:{company_id}] Sandbox ready, checking browser runtime...")
+            already_installed = _ensure_browser_runtime(sandbox)
+            if already_installed:
+                print(f"[browser:{company_id}] Playwright found in snapshot")
+            else:
+                print(f"[browser:{company_id}] Playwright was installed from scratch")
+            sandbox.write_file("/app/browser_server.py", SANDBOX_BROWSER_SERVER.encode("utf-8"))
+            sandbox.write_file("/app/browser_rpc.py", SANDBOX_RPC_CLIENT.encode("utf-8"))
+
+            last_failure: BrowserArtifact | None = None
+
+            for attempt in range(MAX_BROWSER_ATTEMPTS):
+                if attempt > 0:
+                    print(f"[browser:{company_id}] Retry {attempt + 1}/{MAX_BROWSER_ATTEMPTS} (reusing sandbox)...")
+
+                result = _run_browser_attempt(
+                    backend=backend,
+                    sandbox=sandbox,
+                    company=validated_company,
                     run_id=run_id,
-                    status="success",
-                    screenshot_path=str(screenshot_path),
-                    metadata_path=str(metadata_path),
-                    metadata=artifact.metadata,
+                    artifact_dir=artifact_dir,
+                    screenshot_path=screenshot_path,
+                    metadata_path=metadata_path,
                 )
-            except Exception as exc:
-                return BrowserArtifact(
-                    company=company,
-                    run_id=run_id,
-                    status="failed",
-                    failure_reason=str(exc),
-                    failure_stage=classify_browser_failure_stage(str(exc)),
-                    diagnostics=_collect_browser_diagnostics(
-                        sandbox=sandbox,
-                        proc=proc,
-                        artifact_dir=artifact_dir,
-                    ),
-                )
-            finally:
-                try:
-                    tools.shutdown()
-                except Exception:
-                    pass
-                if proc is not None:
-                    try:
-                        sandbox.kill_process(proc.pid)
-                    except Exception:
-                        pass
+
+                if result.status == "success":
+                    title = result.metadata.title if result.metadata else "?"
+                    print(f"[browser:{company_id}] Success — page title: {title!r}")
+                    return result.model_dump(mode="json")
+
+                last_failure = result
+                stage = result.failure_stage or "browser_execution"
+
+                if not is_retryable(stage):
+                    print(f"[browser:{company_id}] Non-retryable failure ({stage}): {result.failure_reason}")
+                    return result.model_dump(mode="json")
+
+                if attempt < MAX_BROWSER_ATTEMPTS - 1:
+                    print(f"[browser:{company_id}] Attempt {attempt + 1} failed ({stage}), will retry...")
+
+            print(f"[browser:{company_id}] All {MAX_BROWSER_ATTEMPTS} attempts exhausted")
+            return last_failure.model_dump(mode="json")
+
     except Exception as exc:
         return BrowserArtifact(
-            company=company,
+            company=validated_company,
             run_id=run_id,
             status="failed",
             failure_reason=str(exc),
             failure_stage="sandbox_startup",
             diagnostics={"artifact_dir": str(artifact_dir)},
+        ).model_dump(mode="json")
+
+
+def _run_browser_attempt(
+    backend: object,
+    sandbox: object,
+    company: Company,
+    run_id: str,
+    artifact_dir: Path,
+    screenshot_path: Path,
+    metadata_path: Path,
+) -> BrowserArtifact:
+    """Single browser attempt inside an existing sandbox. Never raises."""
+    proc = None
+    tools = SandboxBrowserTools(sandbox=sandbox, save_dir=str(artifact_dir))
+    try:
+        print(f"[browser:{company.id}] Launching browser server for {company.url}")
+        proc = sandbox.start_process(
+            "python3",
+            args=["/app/browser_server.py", "--url", str(company.url)],
+            stdout_mode=OutputMode.CAPTURE,
+            stderr_mode=OutputMode.CAPTURE,
         )
+        try:
+            _wait_for_browser_server(tools)
+        except RuntimeError:
+            # Log server output to help diagnose startup failures
+            try:
+                stdout = sandbox.get_stdout(proc.pid)
+                stderr = sandbox.get_stderr(proc.pid)
+                if stdout:
+                    print(f"    [server stdout] {str(stdout)[:500]}")
+                if stderr:
+                    print(f"    [server stderr] {str(stderr)[:500]}")
+            except Exception:
+                pass
+            raise
+        print(f"[browser:{company.id}] Browser server ready, running agent...")
+        artifact = backend.drive_browser(company=company, tools=tools)
+        screenshot_bytes = sandbox.read_file("/app/screenshot.png")
+        if artifact.metadata is None:
+            raise ValueError("browser agent returned no metadata")
+        metadata_bytes = json.dumps(artifact.metadata.model_dump(mode="json")).encode("utf-8")
+        screenshot_path.write_bytes(screenshot_bytes)
+        metadata_path.write_bytes(metadata_bytes)
+        return BrowserArtifact(
+            company=company,
+            run_id=run_id,
+            status="success",
+            screenshot_path=str(screenshot_path),
+            metadata_path=str(metadata_path),
+            metadata=artifact.metadata,
+        )
+    except Exception as exc:
+        print(f"[browser:{company.id}] Attempt failed: {exc}")
+        return BrowserArtifact(
+            company=company,
+            run_id=run_id,
+            status="failed",
+            failure_reason=str(exc),
+            failure_stage=classify_browser_failure_stage(str(exc)),
+            diagnostics=_collect_browser_diagnostics(
+                sandbox=sandbox,
+                proc=proc,
+                artifact_dir=artifact_dir,
+            ),
+        )
+    finally:
+        try:
+            tools.shutdown()
+        except Exception:
+            pass
+        if proc is not None:
+            try:
+                sandbox.kill_process(proc.pid)
+            except Exception:
+                pass
 
 
 
@@ -420,30 +473,65 @@ def report_agent(
     return bundle.model_dump(mode="json")
 
 
-def _wait_for_browser_server(tools: SandboxBrowserTools, timeout_seconds: float = 15.0) -> None:
+def _wait_for_browser_server(tools: SandboxBrowserTools, timeout_seconds: float = 90.0) -> None:
+    """Wait for the browser server to be reachable AND the browser to be ready."""
     deadline = time.time() + timeout_seconds
     last_error: Exception | None = None
+    server_up = False
+
     while time.time() < deadline:
         try:
-            tools.wait(0.1)
-            return
+            result = tools._rpc("ping")
+            if not server_up:
+                print(f"    [server] HTTP server is up, waiting for browser...")
+                server_up = True
+            if result.get("error"):
+                raise RuntimeError(f"browser launch failed: {result['error']}")
+            if result.get("ready"):
+                return
+            time.sleep(1.0)
+        except RuntimeError:
+            raise
         except Exception as exc:
             last_error = exc
-            time.sleep(0.5)
-    raise RuntimeError("browser server failed to start") from last_error
+            time.sleep(1.0)
+
+    if server_up:
+        raise RuntimeError("browser server responded but browser never became ready")
+    raise RuntimeError(
+        f"browser server not reachable after {timeout_seconds}s: {last_error}"
+    ) from last_error
 
 
-def _ensure_browser_runtime(sandbox: object) -> None:
-    check = sandbox.run("python", args=["-c", "import playwright"], timeout=15)
+def _ensure_browser_runtime(sandbox: object) -> bool:
+    """Check if Playwright is installed, install if missing. Returns True if already present."""
+    check = sandbox.run("python3", args=["-c", "import playwright"], timeout=15)
     if check.exit_code == 0:
-        return
+        # Also verify chromium binary exists
+        browser_check = sandbox.run(
+            "python3", args=["-c", "from playwright.sync_api import sync_playwright; print('ok')"], timeout=15
+        )
+        if browser_check.exit_code == 0:
+            return True
+
+    print("    [sandbox] Playwright not found in snapshot, installing (this may take a minute)...")
+    # Redirect all output to log file to avoid noisy sandbox polling
     install = sandbox.run(
         "sh",
-        args=["-lc", BROWSER_SERVER_BOOTSTRAP],
+        args=["-c", (
+            "python3 -m pip install --break-system-packages -q playwright > /tmp/pw-setup.log 2>&1 && "
+            "python3 -m playwright install --with-deps chromium >> /tmp/pw-setup.log 2>&1"
+        )],
         timeout=720,
     )
     if install.exit_code != 0:
-        raise RuntimeError(install.stderr or install.stdout or "failed to install browser runtime")
+        try:
+            log = sandbox.read_file("/tmp/pw-setup.log").decode("utf-8", errors="replace")[-2000:]
+        except Exception:
+            log = install.stderr or install.stdout or "no output"
+        raise RuntimeError(f"failed to install browser runtime: {log}")
+    print("    [sandbox] Playwright + Chromium installed")
+    return False
 
 
 def _collect_browser_diagnostics(sandbox: object, proc: object | None, artifact_dir: Path) -> dict:
