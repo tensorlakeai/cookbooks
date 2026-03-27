@@ -152,7 +152,7 @@ def build_html_report(
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Competitive Analysis: {domain}</title>
+<title>UI Homepage Analysis: {domain}</title>
 <style>
     * {{ margin: 0; padding: 0; box-sizing: border-box; }}
     body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -190,7 +190,7 @@ def build_html_report(
 </style>
 </head>
 <body>
-    <h1>Competitive Analysis: {domain}</h1>
+    <h1>UI Homepage Analysis: {domain}</h1>
     <p class="subtitle">{len(scorecards)} companies analyzed</p>
 
     <h2>Rankings</h2>

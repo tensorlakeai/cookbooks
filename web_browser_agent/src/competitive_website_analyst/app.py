@@ -47,8 +47,8 @@ def competitive_analyst(domain: str, count: int) -> dict:
         print(f"{'─'*60}")
 
         # Research: discover new companies
-        print(f"\n[research] Searching for {needed + 5} candidates in '{domain}'...")
-        candidates = research_agent(domain, needed + 5)
+        print(f"\n[research] Searching for {needed + 2} candidates in '{domain}'...")
+        candidates = research_agent(domain, needed + 2)
         new_companies = [c for c in candidates if c["url"] not in tried_urls][:needed]
         if not new_companies:
             print(f"[research] No new companies found (all duplicates of already-tried URLs)")
