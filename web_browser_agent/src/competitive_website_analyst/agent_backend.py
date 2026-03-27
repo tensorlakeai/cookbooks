@@ -134,11 +134,11 @@ class ClaudeAgentSDKBackend:
                 screenshot_bytes = open(artifact.screenshot_path, "rb").read()
             except OSError:
                 pass
-        return self._run_query(prompt=prompt, max_turns=3, image=screenshot_bytes, allowed_tools=[])
+        return self._run_api_query(prompt=prompt, image=screenshot_bytes)
 
     def report(self, scorecards: list[Scorecard]) -> str:
         prompt = REPORT_PROMPT.format(scorecards=json.dumps([card.model_dump(mode="json") for card in scorecards]))
-        return self._run_query(prompt=prompt, max_turns=4, allowed_tools=[])
+        return self._run_api_query(prompt=prompt)
 
     def _run_query(
         self,
@@ -240,6 +240,38 @@ class ClaudeAgentSDKBackend:
         text = final_result or "\n".join(part for part in assistant_chunks if part.strip())
         if not text.strip():
             raise RuntimeError("Claude Agent SDK returned no text")
+        return text.strip()
+
+    def _run_api_query(self, prompt: str, image: bytes | None = None) -> str:
+        """Call the Anthropic API directly — faster than the agent SDK for tool-free queries."""
+        try:
+            import anthropic
+        except ImportError as exc:
+            raise ImportError(
+                "anthropic is required for direct API calls. "
+                "Install it with `pip install anthropic`."
+            ) from exc
+        client = anthropic.Anthropic()
+        content: list[Any] = []
+        if image is not None:
+            content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": base64.b64encode(image).decode("ascii"),
+                },
+            })
+        content.append({"type": "text", "text": prompt})
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=4096,
+            system="Return precise output. If JSON is requested, return JSON only.",
+            messages=[{"role": "user", "content": content}],
+        )
+        text = response.content[0].text if response.content else ""
+        if not text.strip():
+            raise RuntimeError("Anthropic API returned no text")
         return text.strip()
 
     def _run_browser_agent(self, company: Company, tools: BrowserTools) -> BrowserArtifact:

@@ -150,36 +150,41 @@ def browser_agent(company: dict) -> dict:
 
     print(f"[browser:{company_id}] Starting — {validated_company.name} ({validated_company.url})")
 
+    snapshot_id = os.environ.get("BROWSER_SANDBOX_SNAPSHOT_ID")
     client = SandboxClient.for_cloud()
     try:
         with client.create_and_connect(
-            image="python:3.11-slim",
+            image=None if snapshot_id else "python:3.11-slim",
+            snapshot_id=snapshot_id or None,
             allow_internet_access=True,
             timeout_secs=600,
             startup_timeout=120,
             memory_mb=4096,
             ephemeral_disk_mb=8192,
         ) as sandbox:
-            print(f"[browser:{company_id}] Sandbox ready, installing Playwright...")
-            r = sandbox.run(
-                "python3",
-                args=["-m", "pip", "install", "--break-system-packages", "-q", "playwright"],
-                timeout=120,
-            )
-            if r.exit_code != 0:
-                raise RuntimeError(f"pip install playwright failed: {r.stderr or r.stdout}")
-            r = sandbox.run(
-                "sh",
-                args=["-c", "python3 -m playwright install --with-deps chromium > /tmp/pw.log 2>&1"],
-                timeout=360,
-            )
-            if r.exit_code != 0:
-                try:
-                    log = sandbox.read_file("/tmp/pw.log").decode("utf-8", errors="replace")[-2000:]
-                except Exception:
-                    log = r.stderr or r.stdout or "no output"
-                raise RuntimeError(f"playwright install chromium failed: {log}")
-            print(f"[browser:{company_id}] Playwright installed, writing scripts...")
+            if snapshot_id:
+                print(f"[browser:{company_id}] Restored from snapshot {snapshot_id}, skipping Playwright install")
+            else:
+                print(f"[browser:{company_id}] Sandbox ready, installing Playwright...")
+                r = sandbox.run(
+                    "python3",
+                    args=["-m", "pip", "install", "--break-system-packages", "-q", "playwright"],
+                    timeout=120,
+                )
+                if r.exit_code != 0:
+                    raise RuntimeError(f"pip install playwright failed: {r.stderr or r.stdout}")
+                r = sandbox.run(
+                    "sh",
+                    args=["-c", "python3 -m playwright install --with-deps chromium > /tmp/pw.log 2>&1"],
+                    timeout=360,
+                )
+                if r.exit_code != 0:
+                    try:
+                        log = sandbox.read_file("/tmp/pw.log").decode("utf-8", errors="replace")[-2000:]
+                    except Exception:
+                        log = r.stderr or r.stdout or "no output"
+                    raise RuntimeError(f"playwright install chromium failed: {log}")
+            print(f"[browser:{company_id}] Writing scripts...")
             sandbox.write_file("/app/browser_server.py", SANDBOX_BROWSER_SERVER.encode("utf-8"))
             sandbox.write_file("/app/browser_rpc.py", SANDBOX_RPC_CLIENT.encode("utf-8"))
 
@@ -303,6 +308,62 @@ def _run_browser_attempt(
             except Exception:
                 pass
 
+
+
+@application()
+@function(timeout=600, secrets=["TENSORLAKE_API_KEY"])
+def create_browser_snapshot() -> dict:
+    """One-time setup: build a sandbox snapshot with Playwright pre-installed.
+
+    Run this once, then set BROWSER_SANDBOX_SNAPSHOT_ID to the returned
+    snapshot_id so every browser_agent call skips the Playwright install step.
+
+    Usage:
+        python -c "
+        from competitive_website_analyst.app import create_browser_snapshot
+        from tensorlake.applications import run_local_application
+        import json
+        result = run_local_application(create_browser_snapshot)
+        print(json.dumps(result.output(), indent=2))
+        "
+    """
+    client = SandboxClient.for_cloud()
+    print("[snapshot] Creating sandbox for Playwright install...")
+    with client.create_and_connect(
+        image="python:3.11-slim",
+        allow_internet_access=True,
+        timeout_secs=600,
+        startup_timeout=120,
+        memory_mb=4096,
+        ephemeral_disk_mb=8192,
+    ) as sandbox:
+        print("[snapshot] Installing Playwright...")
+        r = sandbox.run(
+            "python3",
+            args=["-m", "pip", "install", "--break-system-packages", "-q", "playwright"],
+            timeout=120,
+        )
+        if r.exit_code != 0:
+            raise RuntimeError(f"pip install playwright failed: {r.stderr or r.stdout}")
+        r = sandbox.run(
+            "sh",
+            args=["-c", "python3 -m playwright install --with-deps chromium > /tmp/pw.log 2>&1"],
+            timeout=360,
+        )
+        if r.exit_code != 0:
+            try:
+                log = sandbox.read_file("/tmp/pw.log").decode("utf-8", errors="replace")[-2000:]
+            except Exception:
+                log = r.stderr or r.stdout or "no output"
+            raise RuntimeError(f"playwright install chromium failed: {log}")
+        print("[snapshot] Playwright installed, taking snapshot (this may take a minute)...")
+        snap_info = client.snapshot_and_wait(sandbox.sandbox_id, timeout=300)
+
+    snapshot_id = snap_info.snapshot_id
+    print(f"\n[snapshot] Done!")
+    print(f"[snapshot] Set this environment variable to skip Playwright installs:")
+    print(f"  export BROWSER_SANDBOX_SNAPSHOT_ID={snapshot_id}")
+    return {"snapshot_id": snapshot_id}
 
 
 @function(timeout=120, secrets=["ANTHROPIC_API_KEY"], retries=Retries(max_retries=1))

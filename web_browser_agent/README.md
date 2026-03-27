@@ -7,28 +7,23 @@ A TensorLake cookbook that researches a market category, captures homepage scree
 ```
 domain + count
       |
-      +------------------+
-      |                  |
-      v                  v
-Research Agent      Ensure Snapshot    -- run in parallel
-      |                  |
-      v                  v
-      +---> Prepare Browser Tasks <---+
-                  |
-                  v
-      Browser Agent (x N)   -- parallel sandboxed Playwright sessions
-                  |
-                  v
-              Filter         -- drops failed browser runs
-                  |
-                  v
-      Analysis Agent (x N)  -- Claude vision scores each screenshot
-                  |
-                  v
-            Report Agent     -- ranked markdown report + CSV summary
+      v
+Research Agent      -- finds N candidate companies (Claude Agent SDK + web search)
+      |
+      v
+Browser Agent (x N) -- parallel sandboxed Playwright sessions (snapshot or fresh install)
+      |
+      v
+  Filter             -- drops failed browser runs
+      |
+      v
+Analysis Agent (x N) -- Claude vision scores each screenshot (direct Anthropic API)
+      |
+      v
+  Report Agent        -- ranked markdown report + CSV summary (direct Anthropic API)
 ```
 
-Each browser agent runs in its own TensorLake Sandbox with Playwright. The Claude Agent SDK handles all LLM reasoning (research, browser interaction, analysis, report generation).
+Each browser agent runs in its own TensorLake Sandbox with Playwright. Research and browser interaction use the Claude Agent SDK (for web search and MCP browser tools). Analysis and report generation call the Anthropic API directly for lower latency.
 
 ## Prerequisites
 
@@ -47,13 +42,27 @@ export TENSORLAKE_API_KEY=your-tensorlake-key
 export ANTHROPIC_API_KEY=your-anthropic-key
 ```
 
-That's it. On the first run the orchestrator automatically creates a TensorLake Sandbox snapshot with Playwright + Chromium installed, then reuses it for every browser agent. This happens once per run — no manual setup needed.
+### (Recommended) Pre-build a sandbox snapshot
 
-To skip the snapshot creation step on subsequent runs, you can pin the snapshot ID printed during the first run:
+Each browser agent installs Playwright + Chromium at startup, which adds several minutes per run. Build a reusable snapshot once to skip that step on every subsequent run:
 
 ```bash
-export BROWSER_SANDBOX_SNAPSHOT_ID=<snapshot-id-from-first-run>
+python -c "
+from competitive_website_analyst.app import create_browser_snapshot
+from tensorlake.applications import run_local_application
+import json
+result = run_local_application(create_browser_snapshot)
+print(json.dumps(result.output(), indent=2))
+"
 ```
+
+Then pin the printed snapshot ID:
+
+```bash
+export BROWSER_SANDBOX_SNAPSHOT_ID=<snapshot-id-from-above>
+```
+
+With this set, browser agents restore from the snapshot instead of reinstalling Playwright, saving several minutes per run.
 
 ## Run Locally
 
@@ -157,3 +166,4 @@ tests/
   test_scoring.py                       # Scoring and CSV tests
   test_utils.py                         # Validation and URL normalization tests
 ```
+
