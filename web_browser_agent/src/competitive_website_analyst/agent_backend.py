@@ -98,6 +98,16 @@ def _trunc(s: str, n: int = 120) -> str:
     return s if len(s) <= n else s[:n] + "…"
 
 
+def _tool_line(name: str, input_dict: dict) -> str:
+    """Short tool summary for non-verbose mode: name + most informative input field."""
+    for key in ("query", "url", "text", "path", "seconds"):
+        if key in input_dict:
+            val = str(input_dict[key])
+            val = val if len(val) <= 80 else val[:80] + "…"
+            return f"tool_use: {name}  {key}={val!r}"
+    return f"tool_use: {name}"
+
+
 class ClaudeAgentSDKBackend:
     """Narrow integration boundary for the real Claude Agent SDK."""
 
@@ -217,7 +227,7 @@ class ClaudeAgentSDKBackend:
                         if verbose:
                             print(f"    [agent] tool_use: {block.name}  input={json.dumps(block.input)}")
                         else:
-                            print(f"    [agent] tool_use: {block.name}")
+                            print(f"    [agent] {_tool_line(block.name, block.input)}")
                     elif verbose:
                         print(f"    [agent] block: {block!r}")
             elif isinstance(message, ResultMessage):
@@ -346,7 +356,7 @@ class ClaudeAgentSDKBackend:
                             if verbose:
                                 print(f"    [agent] tool_use: {block.name}  input={json.dumps(block.input)}")
                             else:
-                                print(f"    [agent] tool_use: {block.name}")
+                                print(f"    [agent] {_tool_line(block.name, block.input)}")
                         elif verbose:
                             print(f"    [agent] block: {block!r}")
                 elif isinstance(message, ResultMessage):

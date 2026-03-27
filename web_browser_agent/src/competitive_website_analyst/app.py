@@ -92,7 +92,7 @@ def competitive_analyst(domain: str, count: int) -> dict:
         print(f"  {card.get('overall_score', 0):5.2f}  {card.get('company', '?')}")
 
     # Report
-    print(f"\n[report] Generating final competitive analysis report...")
+    print(f"\n[report] Generating final Homepage analysis report...")
     result = report_agent(domain, count, all_companies, all_artifacts, scorecards)
     print(f"[report] Done — {result.get('successful_count', 0)} companies in final report")
 
