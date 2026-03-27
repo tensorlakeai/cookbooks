@@ -40,6 +40,12 @@ MAX_BACKFILL_ROUNDS = 3
 @application()
 @function()
 def competitive_analyst(domain: str, count: int) -> dict:
+    print(f"\n{'='*60}")
+    print(f"  Competitive Website Analyst")
+    print(f"  Domain: {domain!r}  |  Target: {count} companies")
+    print(f"{'='*60}\n")
+
+    print("[setup] Ensuring browser sandbox snapshot...")
     snapshot_id = ensure_browser_snapshot()
 
     all_companies: list[dict] = []
@@ -50,34 +56,68 @@ def competitive_analyst(domain: str, count: int) -> dict:
         success_count = sum(1 for a in all_artifacts if a.get("status") == "success")
         needed = count - success_count
         if needed <= 0:
+            print(f"\n[orchestrator] Target reached: {success_count}/{count} successful")
             break
 
-        # Research: discover new companies (ask for extras to account for duplicates)
+        label = "round 1" if round_num == 0 else f"backfill round {round_num + 1}"
+        print(f"\n{'─'*60}")
+        print(f"[orchestrator] {label}: need {needed} more successful companies")
+        print(f"{'─'*60}")
+
+        # Research: discover new companies
+        print(f"\n[research] Searching for {needed + 5} candidates in '{domain}'...")
         candidates = research_agent(domain, needed + 5)
         new_companies = [c for c in candidates if c["url"] not in tried_urls][:needed]
         if not new_companies:
-            print(f"Round {round_num + 1}: no new companies found, stopping")
+            print(f"[research] No new companies found (all duplicates of already-tried URLs)")
             break
 
         tried_urls.update(c["url"] for c in new_companies)
         all_companies.extend(new_companies)
+        print(f"[research] Discovered {len(new_companies)} new companies:")
+        for c in new_companies:
+            print(f"  - {c['name']} ({c['url']})")
 
-        if round_num > 0:
-            names = [c["name"] for c in new_companies]
-            print(f"Round {round_num + 1}: backfilling with {len(new_companies)} new companies: {names}")
-
-        # Browse: run browser agents in parallel for this batch
+        # Browse: run browser agents in parallel
+        print(f"\n[browser] Launching {len(new_companies)} browser agents in parallel...")
         tasks = prepare_browser_tasks(new_companies, snapshot_id)
         results = browser_agent.map(tasks)
         all_artifacts.extend(results)
 
-    # Analysis + report (parallel where possible)
-    successful = [a for a in all_artifacts if a.get("status") == "success"]
-    success_count = len(successful)
-    print(f"Finished browsing: {success_count}/{count} requested, {len(all_artifacts)} total attempted")
+        batch_success = sum(1 for r in results if r.get("status") == "success")
+        batch_failed = len(results) - batch_success
+        print(f"\n[browser] Batch complete: {batch_success} succeeded, {batch_failed} failed")
+        for r in results:
+            name = r.get("company", {}).get("name", "?")
+            if r.get("status") == "success":
+                print(f"  ✓ {name}")
+            else:
+                print(f"  ✗ {name} — {r.get('failure_stage', '?')}: {r.get('failure_reason', '?')[:80]}")
 
+    # Summary
+    successful = [a for a in all_artifacts if a.get("status") == "success"]
+    total_success = len(successful)
+    total_failed = len(all_artifacts) - total_success
+    print(f"\n{'─'*60}")
+    print(f"[orchestrator] Browsing complete: {total_success}/{count} target, "
+          f"{total_failed} failed, {len(tried_urls)} URLs tried")
+    print(f"{'─'*60}")
+
+    # Analysis
+    print(f"\n[analysis] Scoring {len(successful)} homepages in parallel...")
     scorecards = analysis_agent.map(successful)
-    return report_agent(domain, count, all_companies, all_artifacts, scorecards)
+    print(f"[analysis] Scoring complete:")
+    for card in sorted(scorecards, key=lambda c: c.get("overall_score", 0), reverse=True):
+        print(f"  {card.get('overall_score', 0):5.2f}  {card.get('company', '?')}")
+
+    # Report
+    print(f"\n[report] Generating final competitive analysis report...")
+    result = report_agent(domain, count, all_companies, all_artifacts, scorecards)
+    print(f"[report] Done — {result.get('successful_count', 0)} companies in final report")
+    print(f"\n{'='*60}")
+    print(f"  Run complete")
+    print(f"{'='*60}\n")
+    return result
 
 
 @function(timeout=600, secrets=["TENSORLAKE_API_KEY"])
@@ -122,8 +162,11 @@ def prepare_browser_tasks(companies: list[dict], snapshot_id: str) -> list[dict]
 @function(timeout=120, secrets=["ANTHROPIC_API_KEY"], retries=Retries(max_retries=1))
 def research_agent(domain: str, count: int) -> list[dict]:
     backend = get_agent_backend()
+    print(f"[research] Querying LLM for {count} companies in '{domain}'...")
     payload = parse_json(backend.research(domain, count))
-    return [company.model_dump(mode="json") for company in validate_companies(payload, count)]
+    companies = validate_companies(payload, count)
+    print(f"[research] Validated {len(companies)} companies from LLM response")
+    return [company.model_dump(mode="json") for company in companies]
 
 
 MAX_BROWSER_ATTEMPTS = 3
@@ -149,6 +192,7 @@ def browser_agent(task: dict) -> dict:
     snapshot_id = task["snapshot_id"]
     company_id = validated_company.id
 
+    print(f"[browser:{company_id}] Starting — {validated_company.name} ({validated_company.url})")
     last_failure: BrowserArtifact | None = None
 
     for attempt in range(MAX_BROWSER_ATTEMPTS):
@@ -158,6 +202,10 @@ def browser_agent(task: dict) -> dict:
         screenshot_path = artifact_dir / "screenshot.png"
         metadata_path = artifact_dir / "metadata.json"
 
+        if attempt > 0:
+            print(f"[browser:{company_id}] Attempt {attempt + 1}/{MAX_BROWSER_ATTEMPTS}...")
+
+        print(f"[browser:{company_id}] Creating sandbox and navigating to {validated_company.url}")
         result = _run_browser_session(
             backend=backend,
             company=validated_company,
@@ -169,19 +217,21 @@ def browser_agent(task: dict) -> dict:
         )
 
         if result.status == "success":
+            title = result.metadata.title if result.metadata else "?"
+            print(f"[browser:{company_id}] Success — page title: {title!r}")
             return result.model_dump(mode="json")
 
         last_failure = result
         stage = result.failure_stage or "browser_execution"
 
         if not is_retryable(stage):
-            print(f"[{company_id}] non-retryable failure ({stage}): {result.failure_reason}")
+            print(f"[browser:{company_id}] Non-retryable failure ({stage}): {result.failure_reason}")
             return result.model_dump(mode="json")
 
         if attempt < MAX_BROWSER_ATTEMPTS - 1:
-            print(f"[{company_id}] attempt {attempt + 1} failed ({stage}), retrying...")
+            print(f"[browser:{company_id}] Attempt {attempt + 1} failed ({stage}), retrying...")
 
-    print(f"[{company_id}] all {MAX_BROWSER_ATTEMPTS} attempts exhausted")
+    print(f"[browser:{company_id}] All {MAX_BROWSER_ATTEMPTS} attempts exhausted")
     return last_failure.model_dump(mode="json")
 
 
@@ -270,16 +320,20 @@ def _run_browser_session(
 def analysis_agent(artifact: dict) -> dict:
     backend = get_agent_backend()
     validated_artifact = BrowserArtifact.model_validate(artifact)
+    company_name = validated_artifact.company.name
+    print(f"[analysis:{company_name}] Scoring homepage with vision...")
     if not validated_artifact.screenshot_path or not validated_artifact.metadata:
         raise ValueError("analysis requires screenshot_path and metadata")
     payload = parse_json(backend.analyze(validated_artifact))
     scorecard = Scorecard.model_validate(payload)
+    overall = compute_overall_score(scorecard.scores)
     adjusted = scorecard.model_copy(
         update={
             "run_id": validated_artifact.run_id,
-            "overall_score": compute_overall_score(scorecard.scores),
+            "overall_score": overall,
         }
     )
+    print(f"[analysis:{company_name}] Score: {overall:.2f}/10")
     return adjusted.model_dump(mode="json")
 
 
@@ -298,6 +352,7 @@ def report_agent(
         if artifact.get("status") != "success"
     ]
     if not validated_scorecards:
+        print("[report] No successful scorecards — generating empty report")
         return build_empty_report_bundle(
             domain=domain,
             requested_count=requested_count,
@@ -305,6 +360,8 @@ def report_agent(
             failures=[failure.model_dump(mode="json") for failure in failures],
         ).model_dump(mode="json")
 
+    print(f"[report] Generating report for {len(validated_scorecards)} companies "
+          f"({len(failures)} failures)...")
     backend = get_agent_backend()
     report_markdown = backend.report(validated_scorecards)
     bundle = ReportBundle(
@@ -318,6 +375,8 @@ def report_agent(
         markdown_report=report_markdown,
         summary_csv=build_summary_csv(validated_scorecards),
     )
+    print(f"[report] Report ready — {len(validated_scorecards)} scorecards, "
+          f"{len(bundle.markdown_report)} chars markdown")
     return bundle.model_dump(mode="json")
 
 
