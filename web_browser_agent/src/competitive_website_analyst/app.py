@@ -9,7 +9,7 @@ from tensorlake.applications import Image, Retries, application, function, run_l
 from tensorlake.sandbox import OutputMode, SandboxClient
 
 from competitive_website_analyst.agent_backend import get_agent_backend
-from competitive_website_analyst.browser_failures import classify_browser_failure_stage
+from competitive_website_analyst.browser_failures import classify_browser_failure_stage, is_retryable
 from competitive_website_analyst.browser_runtime import SANDBOX_BROWSER_SERVER, SANDBOX_RPC_CLIENT, SandboxBrowserTools
 from competitive_website_analyst.models import BrowserArtifact, Company, FailureRecord, ReportBundle, Scorecard
 from competitive_website_analyst.scoring import build_empty_report_bundle, build_summary_csv, compute_overall_score, sort_scorecards
@@ -34,16 +34,50 @@ tail -100 /tmp/playwright-install.log
 """
 
 
+MAX_BACKFILL_ROUNDS = 3
+
+
 @application()
 @function()
 def competitive_analyst(domain: str, count: int) -> dict:
-    companies = research_agent.future(domain, count)
-    snapshot_id = ensure_browser_snapshot.future()
-    browser_tasks = prepare_browser_tasks.future(companies, snapshot_id)
-    raw_artifacts = browser_agent.map(browser_tasks)
-    successful_artifacts = filter_successful.future(raw_artifacts)
-    scorecards = analysis_agent.map(successful_artifacts)
-    return report_agent.future(domain, count, companies, raw_artifacts, scorecards)
+    snapshot_id = ensure_browser_snapshot()
+
+    all_companies: list[dict] = []
+    all_artifacts: list[dict] = []
+    tried_urls: set[str] = set()
+
+    for round_num in range(MAX_BACKFILL_ROUNDS):
+        success_count = sum(1 for a in all_artifacts if a.get("status") == "success")
+        needed = count - success_count
+        if needed <= 0:
+            break
+
+        # Research: discover new companies (ask for extras to account for duplicates)
+        candidates = research_agent(domain, needed + 5)
+        new_companies = [c for c in candidates if c["url"] not in tried_urls][:needed]
+        if not new_companies:
+            print(f"Round {round_num + 1}: no new companies found, stopping")
+            break
+
+        tried_urls.update(c["url"] for c in new_companies)
+        all_companies.extend(new_companies)
+
+        if round_num > 0:
+            names = [c["name"] for c in new_companies]
+            print(f"Round {round_num + 1}: backfilling with {len(new_companies)} new companies: {names}")
+
+        # Browse: run browser agents in parallel for this batch
+        tasks = prepare_browser_tasks(new_companies, snapshot_id)
+        results = browser_agent.map(tasks)
+        all_artifacts.extend(results)
+
+    # Analysis + report (parallel where possible)
+    successful = [a for a in all_artifacts if a.get("status") == "success"]
+    success_count = len(successful)
+    print(f"Finished browsing: {success_count}/{count} requested, {len(all_artifacts)} total attempted")
+
+    scorecards = analysis_agent.map(successful)
+    return report_agent(domain, count, all_companies, all_artifacts, scorecards)
 
 
 @function(timeout=600, secrets=["TENSORLAKE_API_KEY"])
@@ -92,14 +126,20 @@ def research_agent(domain: str, count: int) -> list[dict]:
     return [company.model_dump(mode="json") for company in validate_companies(payload, count)]
 
 
+MAX_BROWSER_ATTEMPTS = 3
+
+
 @function(
     image=browser_image,
-    timeout=180,
+    timeout=600,
     secrets=["ANTHROPIC_API_KEY", "TENSORLAKE_API_KEY"],
-    retries=Retries(max_retries=2),
 )
 def browser_agent(task: dict) -> dict:
     """Browse a single company's homepage inside a sandboxed Playwright session.
+
+    Retries internally up to MAX_BROWSER_ATTEMPTS for retryable failures
+    (timeout, browser crash, sandbox issues). Non-retryable failures
+    (DNS errors, CAPTCHA blocks) fail immediately.
 
     Args:
         task: {"company": <Company dict>, "snapshot_id": <str>}
@@ -108,12 +148,53 @@ def browser_agent(task: dict) -> dict:
     validated_company = Company.model_validate(task["company"])
     snapshot_id = task["snapshot_id"]
     company_id = validated_company.id
-    run_id = make_run_id(company_id, suffix=os.urandom(4).hex())
-    artifact_dir = Path("/tmp/artifacts") / run_id
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    screenshot_path = artifact_dir / "screenshot.png"
-    metadata_path = artifact_dir / "metadata.json"
 
+    last_failure: BrowserArtifact | None = None
+
+    for attempt in range(MAX_BROWSER_ATTEMPTS):
+        run_id = make_run_id(company_id, suffix=os.urandom(4).hex())
+        artifact_dir = Path("/tmp/artifacts") / run_id
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        screenshot_path = artifact_dir / "screenshot.png"
+        metadata_path = artifact_dir / "metadata.json"
+
+        result = _run_browser_session(
+            backend=backend,
+            company=validated_company,
+            snapshot_id=snapshot_id,
+            run_id=run_id,
+            artifact_dir=artifact_dir,
+            screenshot_path=screenshot_path,
+            metadata_path=metadata_path,
+        )
+
+        if result.status == "success":
+            return result.model_dump(mode="json")
+
+        last_failure = result
+        stage = result.failure_stage or "browser_execution"
+
+        if not is_retryable(stage):
+            print(f"[{company_id}] non-retryable failure ({stage}): {result.failure_reason}")
+            return result.model_dump(mode="json")
+
+        if attempt < MAX_BROWSER_ATTEMPTS - 1:
+            print(f"[{company_id}] attempt {attempt + 1} failed ({stage}), retrying...")
+
+    print(f"[{company_id}] all {MAX_BROWSER_ATTEMPTS} attempts exhausted")
+    return last_failure.model_dump(mode="json")
+
+
+def _run_browser_session(
+    backend: object,
+    company: Company,
+    snapshot_id: str,
+    run_id: str,
+    artifact_dir: Path,
+    screenshot_path: Path,
+    metadata_path: Path,
+) -> BrowserArtifact:
+    """Single browser attempt. Returns a BrowserArtifact (success or failed), never raises."""
     client = SandboxClient.for_cloud()
     try:
         with client.create_and_connect(
@@ -130,12 +211,12 @@ def browser_agent(task: dict) -> dict:
                 sandbox.write_file("/app/browser_rpc.py", SANDBOX_RPC_CLIENT.encode("utf-8"))
                 proc = sandbox.start_process(
                     "python",
-                    args=["/app/browser_server.py", "--url", str(validated_company.url)],
+                    args=["/app/browser_server.py", "--url", str(company.url)],
                     stdout_mode=OutputMode.CAPTURE,
                     stderr_mode=OutputMode.CAPTURE,
                 )
                 _wait_for_browser_server(tools)
-                artifact = backend.drive_browser(company=validated_company, tools=tools)
+                artifact = backend.drive_browser(company=company, tools=tools)
                 screenshot_bytes = sandbox.read_file("/app/screenshot.png")
                 if artifact.metadata is None:
                     raise ValueError("browser agent returned no metadata")
@@ -143,16 +224,16 @@ def browser_agent(task: dict) -> dict:
                 screenshot_path.write_bytes(screenshot_bytes)
                 metadata_path.write_bytes(metadata_bytes)
                 return BrowserArtifact(
-                    company=validated_company,
+                    company=company,
                     run_id=run_id,
                     status="success",
                     screenshot_path=str(screenshot_path),
                     metadata_path=str(metadata_path),
                     metadata=artifact.metadata,
-                ).model_dump(mode="json")
+                )
             except Exception as exc:
                 return BrowserArtifact(
-                    company=validated_company,
+                    company=company,
                     run_id=run_id,
                     status="failed",
                     failure_reason=str(exc),
@@ -162,7 +243,7 @@ def browser_agent(task: dict) -> dict:
                         proc=proc,
                         artifact_dir=artifact_dir,
                     ),
-                ).model_dump(mode="json")
+                )
             finally:
                 try:
                     tools.shutdown()
@@ -175,23 +256,14 @@ def browser_agent(task: dict) -> dict:
                         pass
     except Exception as exc:
         return BrowserArtifact(
-            company=validated_company,
+            company=company,
             run_id=run_id,
             status="failed",
             failure_reason=str(exc),
             failure_stage="sandbox_startup",
             diagnostics={"artifact_dir": str(artifact_dir)},
-        ).model_dump(mode="json")
+        )
 
-
-@function()
-def filter_successful(artifacts: list[dict]) -> list[dict]:
-    successful = [a for a in artifacts if a.get("status") == "success"]
-    failed = [a for a in artifacts if a.get("status") != "success"]
-    if failed:
-        names = [a.get("company", {}).get("name", "unknown") for a in failed]
-        print(f"Skipping {len(failed)} failed sites: {names}")
-    return successful
 
 
 @function(timeout=120, secrets=["ANTHROPIC_API_KEY"], retries=Retries(max_retries=1))
