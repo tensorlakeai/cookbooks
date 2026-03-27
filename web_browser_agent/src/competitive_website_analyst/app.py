@@ -8,7 +8,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from tensorlake.applications import Image, Retries, application, function, run_local_application
+from tensorlake.applications import Retries, application, function, run_local_application
 from tensorlake.sandbox import OutputMode, SandboxClient
 
 from competitive_website_analyst.agent_backend import get_agent_backend
@@ -17,24 +17,6 @@ from competitive_website_analyst.browser_runtime import SANDBOX_BROWSER_SERVER, 
 from competitive_website_analyst.models import BrowserArtifact, Company, FailureRecord, ReportBundle, Scorecard
 from competitive_website_analyst.scoring import build_empty_report_bundle, build_html_report, build_summary_csv, compute_overall_score, sort_scorecards
 from competitive_website_analyst.utils import make_run_id, parse_json, validate_companies
-
-
-browser_image = Image(base_image="python:3.11-slim").run(
-    "pip install playwright && playwright install chromium --with-deps"
-)
-
-BROWSER_SERVER_BOOTSTRAP = """\
-set -e
-if ! python3 -c "import playwright" >/dev/null 2>&1; then
-  python3 -m pip install --break-system-packages playwright >/tmp/pip-playwright.log 2>&1
-  tail -100 /tmp/pip-playwright.log
-fi
-python3 -m playwright install --with-deps chromium >/tmp/playwright-install.log 2>&1 || {
-  cat /tmp/playwright-install.log
-  exit 1
-}
-tail -100 /tmp/playwright-install.log
-"""
 
 
 MAX_BACKFILL_ROUNDS = 3
@@ -47,9 +29,6 @@ def competitive_analyst(domain: str, count: int) -> dict:
     print(f"  Competitive Website Analyst")
     print(f"  Domain: {domain!r}  |  Target: {count} companies")
     print(f"{'='*60}\n")
-
-    print("[setup] Ensuring browser sandbox snapshot...")
-    snapshot_id = ensure_browser_snapshot()
 
     all_companies: list[dict] = []
     all_artifacts: list[dict] = []
@@ -83,8 +62,7 @@ def competitive_analyst(domain: str, count: int) -> dict:
 
         # Browse: run browser agents in parallel
         print(f"\n[browser] Launching {len(new_companies)} browser agents in parallel...")
-        tasks = prepare_browser_tasks(new_companies, snapshot_id)
-        results = browser_agent.map(tasks)
+        results = browser_agent.map(new_companies)
         all_artifacts.extend(results)
 
         batch_success = sum(1 for r in results if r.get("status") == "success")
@@ -138,75 +116,6 @@ def competitive_analyst(domain: str, count: int) -> dict:
     return result
 
 
-@function(timeout=600, secrets=["TENSORLAKE_API_KEY"])
-def ensure_browser_snapshot() -> str:
-    """Return a sandbox snapshot ID with Playwright pre-installed.
-
-    If BROWSER_SANDBOX_SNAPSHOT_ID is already set, return it immediately.
-    Otherwise, create a fresh sandbox, install Playwright + Chromium,
-    snapshot it, and return the new snapshot ID.
-    """
-    existing = os.getenv("BROWSER_SANDBOX_SNAPSHOT_ID")
-    if existing:
-        print(f"Using existing browser snapshot: {existing}")
-        return existing
-
-    if not os.getenv("TENSORLAKE_API_KEY"):
-        raise RuntimeError(
-            "TENSORLAKE_API_KEY is required to create browser sandboxes. "
-            "Set it with: export TENSORLAKE_API_KEY=<your-key>"
-        )
-    print("No browser snapshot found — creating one with Playwright + Chromium...")
-    client = SandboxClient.for_cloud()
-    with client.create_and_connect(
-        image="python:3.11-slim",
-        allow_internet_access=True,
-        timeout_secs=600,
-        startup_timeout=120,
-    ) as sandbox:
-        # Step 1: Install playwright pip package
-        print("[setup] Installing playwright pip package...")
-        result = sandbox.run(
-            "python3",
-            args=["-m", "pip", "install", "--break-system-packages", "playwright"],
-            timeout=120,
-        )
-        if result.exit_code != 0:
-            raise RuntimeError(f"pip install playwright failed: {result.stderr or result.stdout}")
-
-        # Step 2: Install Chromium browser (redirect output to file to avoid EPIPE)
-        print("[setup] Installing Chromium (this may take a minute)...")
-        result = sandbox.run(
-            "sh",
-            args=["-c", "python3 -m playwright install --with-deps chromium > /tmp/pw-install.log 2>&1"],
-            timeout=300,
-        )
-        if result.exit_code != 0:
-            # Read the log for diagnostics
-            try:
-                log = sandbox.read_file("/tmp/pw-install.log").decode("utf-8", errors="replace")[-3000:]
-            except Exception:
-                log = result.stderr or result.stdout or "no output"
-            raise RuntimeError(f"playwright install chromium failed: {log}")
-
-        # Verify install before snapshotting
-        verify = sandbox.run("python3", args=["-c", "import playwright; print(playwright.__file__)"], timeout=15)
-        print(f"[setup] Playwright verify: exit={verify.exit_code} stdout={verify.stdout.strip()}")
-        if verify.exit_code != 0:
-            raise RuntimeError(f"Playwright install verification failed: {verify.stderr}")
-
-        print("[setup] Browser runtime installed, creating snapshot...")
-        snapshot = client.snapshot_and_wait(sandbox.sandbox_id, timeout=300)
-        print(f"[setup] Created browser snapshot: {snapshot.snapshot_id} (status: {snapshot.status})")
-        return snapshot.snapshot_id
-
-
-@function()
-def prepare_browser_tasks(companies: list[dict], snapshot_id: str) -> list[dict]:
-    """Bundle each company with the shared snapshot ID for browser_agent.map()."""
-    return [{"company": c, "snapshot_id": snapshot_id} for c in companies]
-
-
 @function(timeout=120, secrets=["ANTHROPIC_API_KEY"], retries=Retries(max_retries=1))
 def research_agent(domain: str, count: int) -> list[dict]:
     backend = get_agent_backend()
@@ -221,22 +130,17 @@ MAX_BROWSER_ATTEMPTS = 3
 
 
 @function(
-    image=browser_image,
     timeout=600,
     secrets=["ANTHROPIC_API_KEY", "TENSORLAKE_API_KEY"],
 )
-def browser_agent(task: dict) -> dict:
+def browser_agent(company: dict) -> dict:
     """Browse a single company's homepage inside a sandboxed Playwright session.
 
-    Creates one sandbox and retries the browser server + agent loop inside it
-    up to MAX_BROWSER_ATTEMPTS times for retryable failures.
-
-    Args:
-        task: {"company": <Company dict>, "snapshot_id": <str>}
+    Creates a fresh sandbox, installs Playwright, and retries the browser
+    server + agent loop up to MAX_BROWSER_ATTEMPTS times for retryable failures.
     """
     backend = get_agent_backend()
-    validated_company = Company.model_validate(task["company"])
-    snapshot_id = task["snapshot_id"]
+    validated_company = Company.model_validate(company)
     company_id = validated_company.id
     run_id = make_run_id(company_id, suffix=os.urandom(4).hex())
     artifact_dir = Path("/tmp/artifacts") / run_id
@@ -245,23 +149,37 @@ def browser_agent(task: dict) -> dict:
     metadata_path = artifact_dir / "metadata.json"
 
     print(f"[browser:{company_id}] Starting — {validated_company.name} ({validated_company.url})")
-    print(f"[browser:{company_id}] Using snapshot: {snapshot_id}")
 
-    # Create sandbox once, retry inside it
     client = SandboxClient.for_cloud()
     try:
         with client.create_and_connect(
-            snapshot_id=snapshot_id,
+            image="python:3.11-slim",
             allow_internet_access=True,
-            timeout_secs=300,
-            startup_timeout=180,
+            timeout_secs=600,
+            startup_timeout=120,
+            memory_mb=4096,
+            ephemeral_disk_mb=8192,
         ) as sandbox:
-            print(f"[browser:{company_id}] Sandbox ready, checking browser runtime...")
-            already_installed = _ensure_browser_runtime(sandbox)
-            if already_installed:
-                print(f"[browser:{company_id}] Playwright found in snapshot")
-            else:
-                print(f"[browser:{company_id}] Playwright was installed from scratch")
+            print(f"[browser:{company_id}] Sandbox ready, installing Playwright...")
+            r = sandbox.run(
+                "python3",
+                args=["-m", "pip", "install", "--break-system-packages", "-q", "playwright"],
+                timeout=120,
+            )
+            if r.exit_code != 0:
+                raise RuntimeError(f"pip install playwright failed: {r.stderr or r.stdout}")
+            r = sandbox.run(
+                "sh",
+                args=["-c", "python3 -m playwright install --with-deps chromium > /tmp/pw.log 2>&1"],
+                timeout=360,
+            )
+            if r.exit_code != 0:
+                try:
+                    log = sandbox.read_file("/tmp/pw.log").decode("utf-8", errors="replace")[-2000:]
+                except Exception:
+                    log = r.stderr or r.stdout or "no output"
+                raise RuntimeError(f"playwright install chromium failed: {log}")
+            print(f"[browser:{company_id}] Playwright installed, writing scripts...")
             sandbox.write_file("/app/browser_server.py", SANDBOX_BROWSER_SERVER.encode("utf-8"))
             sandbox.write_file("/app/browser_rpc.py", SANDBOX_RPC_CLIENT.encode("utf-8"))
 
@@ -389,6 +307,9 @@ def _run_browser_attempt(
 
 @function(timeout=120, secrets=["ANTHROPIC_API_KEY"], retries=Retries(max_retries=1))
 def analysis_agent(artifact: dict) -> dict:
+    # Unset CLAUDECODE so claude-agent-sdk can spawn a subprocess when running
+    # locally under a Claude Code session (which sets this env var).
+    os.environ.pop("CLAUDECODE", None)
     backend = get_agent_backend()
     validated_artifact = BrowserArtifact.model_validate(artifact)
     company_name = validated_artifact.company.name
@@ -501,37 +422,6 @@ def _wait_for_browser_server(tools: SandboxBrowserTools, timeout_seconds: float 
     raise RuntimeError(
         f"browser server not reachable after {timeout_seconds}s: {last_error}"
     ) from last_error
-
-
-def _ensure_browser_runtime(sandbox: object) -> bool:
-    """Check if Playwright is installed, install if missing. Returns True if already present."""
-    check = sandbox.run("python3", args=["-c", "import playwright"], timeout=15)
-    if check.exit_code == 0:
-        # Also verify chromium binary exists
-        browser_check = sandbox.run(
-            "python3", args=["-c", "from playwright.sync_api import sync_playwright; print('ok')"], timeout=15
-        )
-        if browser_check.exit_code == 0:
-            return True
-
-    print("    [sandbox] Playwright not found in snapshot, installing (this may take a minute)...")
-    # Redirect all output to log file to avoid noisy sandbox polling
-    install = sandbox.run(
-        "sh",
-        args=["-c", (
-            "python3 -m pip install --break-system-packages -q playwright > /tmp/pw-setup.log 2>&1 && "
-            "python3 -m playwright install --with-deps chromium >> /tmp/pw-setup.log 2>&1"
-        )],
-        timeout=720,
-    )
-    if install.exit_code != 0:
-        try:
-            log = sandbox.read_file("/tmp/pw-setup.log").decode("utf-8", errors="replace")[-2000:]
-        except Exception:
-            log = install.stderr or install.stdout or "no output"
-        raise RuntimeError(f"failed to install browser runtime: {log}")
-    print("    [sandbox] Playwright + Chromium installed")
-    return False
 
 
 def _collect_browser_diagnostics(sandbox: object, proc: object | None, artifact_dir: Path) -> dict:

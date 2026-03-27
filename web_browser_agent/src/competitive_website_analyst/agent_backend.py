@@ -115,11 +115,11 @@ class ClaudeAgentSDKBackend:
                 screenshot_bytes = open(artifact.screenshot_path, "rb").read()
             except OSError:
                 pass
-        return self._run_query(prompt=prompt, max_turns=3, image=screenshot_bytes)
+        return self._run_query(prompt=prompt, max_turns=3, image=screenshot_bytes, allowed_tools=[])
 
     def report(self, scorecards: list[Scorecard]) -> str:
         prompt = REPORT_PROMPT.format(scorecards=json.dumps([card.model_dump(mode="json") for card in scorecards]))
-        return self._run_query(prompt=prompt, max_turns=4)
+        return self._run_query(prompt=prompt, max_turns=4, allowed_tools=[])
 
     def _run_query(
         self,
@@ -151,15 +151,25 @@ class ClaudeAgentSDKBackend:
             "TextBlock",
             "ResultMessage",
         )
+        # allowed_tools=[] means no tools (pass tools=[] → --tools "")
+        # allowed_tools=["X"] means restrict to those tools
+        # allowed_tools=None means no restriction (use claude defaults)
+        if allowed_tools is None:
+            tool_kwargs: dict = {}
+        elif len(allowed_tools) == 0:
+            tool_kwargs = {"tools": []}
+        else:
+            tool_kwargs = {"allowed_tools": allowed_tools}
         options = ClaudeAgentOptions(
+            model="claude-sonnet-4-6",
             system_prompt="Return precise output. If JSON is requested, return JSON only.",
             max_turns=max_turns,
             cwd=os.getcwd(),
-            **({"allowed_tools": allowed_tools} if allowed_tools else {}),
+            **tool_kwargs,
         )
         if image is not None:
             image_b64 = base64.b64encode(image).decode("ascii")
-            prompt_input: Any = [
+            content = [
                 {"type": "text", "text": prompt},
                 {
                     "type": "image",
@@ -170,6 +180,16 @@ class ClaudeAgentSDKBackend:
                     },
                 },
             ]
+            # SDK only accepts str or AsyncIterable — lists silently never get written
+            # to stdin. Wrap in an async generator that yields the user message.
+            async def _prompt_stream():
+                yield {
+                    "type": "user",
+                    "session_id": "",
+                    "message": {"role": "user", "content": content},
+                    "parent_tool_use_id": None,
+                }
+            prompt_input: Any = _prompt_stream()
         else:
             prompt_input = prompt
         ToolUseBlock, = _import_sdk_symbols("ToolUseBlock")
@@ -181,11 +201,17 @@ class ClaudeAgentSDKBackend:
                     if isinstance(block, TextBlock):
                         assistant_chunks.append(block.text)
                         if block.text.strip():
-                            print(f"    [agent] {block.text.strip()[:200]}")
+                            print(f"    [agent] {block.text.strip()}")
                     elif isinstance(block, ToolUseBlock):
-                        print(f"    [agent] tool: {block.name}({json.dumps(block.input)[:120]})")
-            elif isinstance(message, ResultMessage) and message.result:
-                final_result = message.result
+                        print(f"    [agent] tool_use: {block.name}  input={json.dumps(block.input)}")
+                    else:
+                        print(f"    [agent] block: {block!r}")
+            elif isinstance(message, ResultMessage):
+                print(f"    [agent] result: {message.result!r}")
+                if message.result:
+                    final_result = message.result
+            else:
+                print(f"    [agent] message: {message!r}")
         text = final_result or "\n".join(part for part in assistant_chunks if part.strip())
         if not text.strip():
             raise RuntimeError("Claude Agent SDK returned no text")
@@ -253,7 +279,7 @@ class ClaudeAgentSDKBackend:
             agent_state["metadata"] = metadata
             return {"content": [{"type": "text", "text": metadata.model_dump_json()}]}
 
-        @tool("save_screenshot", "Save a final full-page screenshot", {"path": str})
+        @tool("save_screenshot", "Save a final viewport screenshot", {"path": str})
         async def save_screenshot_tool(args: dict[str, Any]) -> dict[str, Any]:
             path = str(args["path"])
             result = tools.save_screenshot(path)
@@ -282,6 +308,7 @@ class ClaudeAgentSDKBackend:
             "save_screenshot",
         ]
         options = ClaudeAgentOptions(
+            model="claude-sonnet-4-6",
             system_prompt="Use the provided browser tools only. Return concise output.",
             max_turns=10,
             cwd=os.getcwd(),
@@ -297,11 +324,17 @@ class ClaudeAgentSDKBackend:
                 if isinstance(message, AssistantMessage):
                     for block in message.content:
                         if isinstance(block, TextBlock) and block.text.strip():
-                            print(f"    [agent] {block.text.strip()[:200]}")
+                            print(f"    [agent] {block.text.strip()}")
                         elif isinstance(block, ToolUseBlock):
-                            print(f"    [agent] tool: {block.name}({json.dumps(block.input)[:120]})")
-                elif isinstance(message, ResultMessage) and message.is_error:
-                    raise RuntimeError(message.result or "browser agent failed")
+                            print(f"    [agent] tool_use: {block.name}  input={json.dumps(block.input)}")
+                        else:
+                            print(f"    [agent] block: {block!r}")
+                elif isinstance(message, ResultMessage):
+                    print(f"    [agent] result: {message.result!r}")
+                    if message.is_error:
+                        raise RuntimeError(message.result or "browser agent failed")
+                else:
+                    print(f"    [agent] message: {message!r}")
         print(f"    [agent] Browser agent loop complete")
 
         # If the agent didn't call save_screenshot, save one now as fallback
@@ -323,11 +356,13 @@ class ClaudeAgentSDKBackend:
         )
 
 
-def _run_async(coro):
+def _run_async(coro, timeout: float = 120.0):
+    async def _with_timeout():
+        return await asyncio.wait_for(coro, timeout=timeout)
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(coro)
+        return asyncio.run(_with_timeout())
     raise RuntimeError("Claude Agent SDK calls require a synchronous TensorLake function context")
 
 

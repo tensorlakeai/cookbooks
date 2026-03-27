@@ -115,7 +115,7 @@ class BrowserServer(HTTPServer):
             data["page_load_time_ms"] = int((time.time() - self.started_at) * 1000)
             return data
         if tool == "save_screenshot":
-            self.page.screenshot(path=args["path"], type="png", full_page=True)
+            self.page.screenshot(path=args["path"], type="png")
             return {"ok": True}
         if tool == "shutdown":
             return {"ok": True, "shutdown": True}
