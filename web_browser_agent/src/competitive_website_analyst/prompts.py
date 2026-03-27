@@ -61,12 +61,15 @@ Return a single JSON object with exactly these fields:
 Return JSON only. Do not wrap in markdown fences. Max 5 strengths and 5 weaknesses."""
 
 
-REPORT_PROMPT = """Generate a concise competitive analysis report from these scorecards:
+REPORT_PROMPT = """Generate a concise competitive UI homepage analysis report from these scorecards:
 {scorecards}
+
+This analysis is based on visual and content evaluation of each company's public homepage only —
+it does not reflect product quality, pricing, or user reviews.
 
 Include:
 - ranked table by overall score
 - per-company section with summary, strengths, weaknesses, and score highlights
 - top 3 lists where enough data exists
-- common messaging patterns
-- gaps and opportunities"""
+- common homepage messaging patterns
+- homepage gaps and opportunities"""

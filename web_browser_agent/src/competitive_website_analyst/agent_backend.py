@@ -89,6 +89,15 @@ class MockAgentBackend:
         return "\n".join(lines)
 
 
+def _is_verbose() -> bool:
+    return os.getenv("COMPETITIVE_ANALYST_VERBOSE") == "1"
+
+
+def _trunc(s: str, n: int = 120) -> str:
+    s = s.strip()
+    return s if len(s) <= n else s[:n] + "…"
+
+
 class ClaudeAgentSDKBackend:
     """Narrow integration boundary for the real Claude Agent SDK."""
 
@@ -195,22 +204,28 @@ class ClaudeAgentSDKBackend:
         ToolUseBlock, = _import_sdk_symbols("ToolUseBlock")
         assistant_chunks: list[str] = []
         final_result: str | None = None
+        verbose = _is_verbose()
         async for message in query(prompt=prompt_input, options=options):
             if isinstance(message, AssistantMessage):
                 for block in message.content:
                     if isinstance(block, TextBlock):
                         assistant_chunks.append(block.text)
                         if block.text.strip():
-                            print(f"    [agent] {block.text.strip()}")
+                            text_out = block.text.strip() if verbose else _trunc(block.text)
+                            print(f"    [agent] {text_out}")
                     elif isinstance(block, ToolUseBlock):
-                        print(f"    [agent] tool_use: {block.name}  input={json.dumps(block.input)}")
-                    else:
+                        if verbose:
+                            print(f"    [agent] tool_use: {block.name}  input={json.dumps(block.input)}")
+                        else:
+                            print(f"    [agent] tool_use: {block.name}")
+                    elif verbose:
                         print(f"    [agent] block: {block!r}")
             elif isinstance(message, ResultMessage):
-                print(f"    [agent] result: {message.result!r}")
+                if verbose:
+                    print(f"    [agent] result: {message.result!r}")
                 if message.result:
                     final_result = message.result
-            else:
+            elif verbose:
                 print(f"    [agent] message: {message!r}")
         text = final_result or "\n".join(part for part in assistant_chunks if part.strip())
         if not text.strip():
@@ -317,6 +332,7 @@ class ClaudeAgentSDKBackend:
         )
         ToolUseBlock, = _import_sdk_symbols("ToolUseBlock")
         prompt = BROWSER_PROMPT.format(company_url=company.url)
+        verbose = _is_verbose()
         print(f"    [agent] Starting browser agent for {company.url}")
         async with ClaudeSDKClient(options=options) as client:
             await client.query(prompt)
@@ -324,16 +340,21 @@ class ClaudeAgentSDKBackend:
                 if isinstance(message, AssistantMessage):
                     for block in message.content:
                         if isinstance(block, TextBlock) and block.text.strip():
-                            print(f"    [agent] {block.text.strip()}")
+                            text_out = block.text.strip() if verbose else _trunc(block.text)
+                            print(f"    [agent] {text_out}")
                         elif isinstance(block, ToolUseBlock):
-                            print(f"    [agent] tool_use: {block.name}  input={json.dumps(block.input)}")
-                        else:
+                            if verbose:
+                                print(f"    [agent] tool_use: {block.name}  input={json.dumps(block.input)}")
+                            else:
+                                print(f"    [agent] tool_use: {block.name}")
+                        elif verbose:
                             print(f"    [agent] block: {block!r}")
                 elif isinstance(message, ResultMessage):
-                    print(f"    [agent] result: {message.result!r}")
+                    if verbose:
+                        print(f"    [agent] result: {message.result!r}")
                     if message.is_error:
                         raise RuntimeError(message.result or "browser agent failed")
-                else:
+                elif verbose:
                     print(f"    [agent] message: {message!r}")
         print(f"    [agent] Browser agent loop complete")
 

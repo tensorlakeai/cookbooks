@@ -468,7 +468,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Competitive Website Analyst")
     parser.add_argument("domain", help="Market category to research (e.g. 'AI coding assistants')")
     parser.add_argument("--count", type=int, default=5, help="Number of companies to discover (default: 5)")
+    parser.add_argument("--verbose", action="store_true", help="Print full agent traces without truncation")
     args = parser.parse_args()
+
+    if args.verbose:
+        os.environ["COMPETITIVE_ANALYST_VERBOSE"] = "1"
 
     request = run_local_application(competitive_analyst, args.domain, args.count)
     print(json.dumps(request.output(), indent=2))
