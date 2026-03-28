@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "competitive-website-analyst"
+version = "0.1.0"
+description = "TensorLake competitive website analyst"
+requires-python = ">=3.11"
+dependencies = [
+  "tensorlake>=0.1.0",
+]
+
+[project.optional-dependencies]
+agents = [
+  "claude-agent-sdk>=0.1.33",
+  "anthropic>=0.40.0",
+]
+dev = [
+  "pytest>=8.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
