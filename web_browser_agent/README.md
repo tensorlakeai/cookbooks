@@ -25,6 +25,34 @@ Analysis Agent (x N) -- Claude vision scores each screenshot (direct Anthropic A
 
 Each browser agent runs in its own TensorLake Sandbox with Playwright. Research and browser interaction use the Claude Agent SDK (for web search and MCP browser tools). Analysis and report generation call the Anthropic API directly for lower latency.
 
+## Agent Architecture
+
+4 agents + 1 infrastructure function (all using Claude Agent SDK or Anthropic API directly):
+
+| # | Agent | Tool Mode | SDK Features |
+|---|-------|-----------|-------------|
+| 1 | `research_agent` | Built-in only | Claude Agent SDK: `WebSearch`, `WebFetch` |
+| 2 | `browser_agent` | Custom MCP only | `ClaudeSDKClient` + 6 custom browser tools via TensorLake Sandbox |
+| 3 | `analysis_agent` | Vision (API direct) | Anthropic API `messages.create` with base64 screenshots |
+| 4 | `report_agent` | API direct | Anthropic API `messages.create` |
+| — | `create_browser_snapshot` | Infrastructure | TensorLake Sandbox snapshot (one-time setup) |
+
+**5-phase orchestration in `competitive_analyst()`:**
+
+1. Web research (`research_agent` — WebSearch/WebFetch, validates + dedupes companies)
+2. Parallel browsing (`browser_agent.map()` — Playwright in sandbox, up to 3 backfill rounds)
+3. Filtering (drop failed artifacts, track tried URLs)
+4. Parallel analysis (`analysis_agent.map()` — vision scoring across 7 dimensions)
+5. Report generation (`report_agent` — markdown + HTML + CSV output)
+
+**Supporting infrastructure:**
+
+- 8 data models (`Company`, `BrowserArtifact`, `Scorecard`, `ReportBundle`, etc.) using a custom `ModelMixin` for Pydantic-like interface
+- `create_sandbox_mcp_server()` with 6 browser tools (`screenshot`, `click_text`, `click_coords`, `wait`, `extract_metadata`, `save_screenshot`)
+- `MockAgentBackend` + `ClaudeAgentSDKBackend` (Protocol-based abstraction for local/cloud)
+- `classify_browser_failure_stage()` with retryable vs non-retryable failure classification
+- Scoring: weighted average across 7 dimensions → HTML report with embedded base64 screenshots
+
 ## Prerequisites
 
 - Python 3.11+
