@@ -39,7 +39,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu
 
 ### Configure your API key
 
-If you do not have one, you may obtain one from `https://tensorlake.ai`.
+If you do not have one, you may obtain one from [https://tensorlake.ai](https://tensorlake.ai).
 
 ```bash
 cp .env.example .env
