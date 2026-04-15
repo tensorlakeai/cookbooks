@@ -27,10 +27,19 @@ GSPO clips the importance sampling ratio at the sequence level (vs. per-token in
 ### Install Python dependencies
 
 ```bash
-pip install tensorlake transformers trl datasets torch rich python-dotenv
+pip install python-dotenv torch datasets transformers trl openenv tensorlake rich
+```
+
+Install the following libraries instead for CPU only systems:
+
+```
+pip install python-dotenv datasets transformers trl openenv tensorlake rich
+pip install torch --index-url https://download.pytorch.org/whl/cpu
 ```
 
 ### Configure your API key
+
+If you do not have one, you may obtain one from `https://tensorlake.ai`.
 
 ```bash
 cp .env.example .env

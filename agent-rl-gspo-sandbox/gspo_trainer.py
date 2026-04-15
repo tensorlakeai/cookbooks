@@ -1,24 +1,31 @@
 """
 RL GSPO Reasoner — Code Generation with Hidden Test Suites
 ===========================================================
-Algorithm : GSPO — Group Sequence Policy Optimization (Zheng et al., 2507.18071)
-            GRPOConfig(importance_sampling_level="sequence")
+Algorithm  : GSPO — Group Sequence Policy Optimization (Zheng et al., 2507.18071)
+             GRPOConfig(importance_sampling_level="sequence")
+Model      : SmolLM2-135M-Instruct
+Parallelism: TensorLake @function map-reduce (one worker per completion per step)
 
 Why sandboxes are non-negotiable here
 --------------------------------------
 The model generates arbitrary Python function bodies.  Running untrusted
 model-generated code in the training process directly would be unsafe.
-Each completion is executed inside an isolated TensorLake sandbox.
-The sandbox runs a hidden pytest suite and returns tests_passed/total as reward.
+Each completion is executed inside a CodeSandboxEnv (an OpenEnv Env subclass)
+whose backend is an isolated TensorLake sandbox.
+The environment runs a hidden pytest suite and returns tests_passed/total as reward.
 
 Training strategy
 -----------------
-  Phase 1 — SFT warmup (N steps):
+  Phase 1 — SFT warmup:
     Supervised pass on correct solutions so the model outputs valid Python.
     Without this, all G completions score 0 → reward_std=0 → no gradient.
   Phase 2 — GSPO fine-tuning:
-    GRPOTrainer with sequence-level IS.  The reward function dispatches G
-    parallel sandboxes per step and prints every completion that scores > 0.
+    GRPOTrainer with sequence-level IS.  reward_sandbox fans out G completions
+    to G parallel TensorLake workers via _run_sandbox_fn.map() and prints every
+    completion that scores > 0.
+
+Entrypoint : train_gspo() decorated with @application() + @function(),
+             invoked via run_local_application(train_gspo).
 
 Smoke : --smoke  →  3 functions, 20 SFT steps, 1 GSPO epoch  (~5 min CPU)
 Full  : 10 functions, 60 SFT steps, 3 GSPO epochs            (~30 min CPU)
@@ -31,12 +38,13 @@ import re
 import sys
 import textwrap
 import torch
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datasets import Dataset
 from torch.optim import AdamW
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOTrainer, GRPOConfig
+from openenv.env.env import Env
 from tensorlake.sandbox import SandboxClient
+from tensorlake.applications import application, function, run_local_application
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -323,18 +331,49 @@ t = p + f
 print(f"{{p}}/{{t}}")
 """
 
+class CodeSandboxEnv(Env):
+    """OpenEnv environment that runs code in a TensorLake sandbox.
+
+    action : Python source code string (one completion)
+    reward : fraction of hidden pytest tests that pass (0.0–1.0)
+    done   : True when all tests pass (reward == 1.0)
+    """
+
+    def __init__(self, tests: str, memory_mb: int = 2048):
+        super().__init__(name="CodeSandboxEnv")
+        self.tests = tests
+        self.memory_mb = memory_mb
+
+    def reset(self):
+        return None  # no observable state between episodes
+
+    def step(self, code: str):
+        harness = _HARNESS.format(code=code, tests=self.tests)
+        reward = 0.0
+        try:
+            sb = SandboxClient()
+            with sb.create_and_connect(memory_mb=self.memory_mb) as box:
+                ex = box.run("python3", ["-c", harness])
+                last = (ex.stdout or "").strip().splitlines()
+                last = last[-1] if last else "0/0"
+            p, t = (int(x) for x in last.split("/"))
+            reward = p / t if t > 0 else 0.0
+        except Exception:
+            pass
+        done = reward == 1.0
+        return None, reward, done, {}
+
+
 def _run_sandbox(code: str, tests: str) -> float:
-    harness = _HARNESS.format(code=code, tests=tests)
-    try:
-        sb = SandboxClient()
-        with sb.create_and_connect(memory_mb=2048) as box:
-            ex = box.run("python3", ["-c", harness])
-            last = (ex.stdout or "").strip().splitlines()
-            last = last[-1] if last else "0/0"
-        p, t = (int(x) for x in last.split("/"))
-        return p / t if t > 0 else 0.0
-    except Exception:
-        return 0.0
+    _, reward, _, _ = CodeSandboxEnv(tests=tests).step(code)
+    return reward
+
+
+@function()
+def _run_sandbox_fn(payload: dict) -> float:
+    """TensorLake @function wrapper used for parallel map-reduce dispatch."""
+    _, reward, _, _ = CodeSandboxEnv(tests=payload["tests"]).step(payload["code"])
+    return reward
 
 
 # ─── Reward function — logs best completion of every batch ───────────────────
@@ -345,48 +384,28 @@ _step       = [0]              # mutable counter (closure-friendly)
 def reward_sandbox(completions, tests: List[str], **kwargs) -> List[float]:
     """
     Reward = fraction of hidden pytest tests that pass (0.0–1.0).
-    G completions are dispatched to G parallel sandboxes.
+    G completions are dispatched to G parallel sandboxes via TensorLake map-reduce.
     Every batch whose best score > 0 is printed immediately.
     """
     codes = [_extract_code(c) for c in completions]
     _step[0] += 1
 
-    # Extract the user-facing prompt text from the chat messages
-    prompts = kwargs.get("prompt", [])
-    def _user_prompt(p) -> str:
-        if isinstance(p, list):
-            for msg in p:
-                if isinstance(msg, dict) and msg.get("role") == "user":
-                    return msg.get("content", "")
-        return str(p)
-    prompt_texts = [_user_prompt(p) for p in prompts]
-
-    with ThreadPoolExecutor(max_workers=len(codes)) as pool:
-        futures = {pool.submit(_run_sandbox, code, test): i
-                   for i, (code, test) in enumerate(zip(codes, tests))}
-        scores = [0.0] * len(codes)
-        for fut in as_completed(futures):
-            i = futures[fut]
-            scores[i] = fut.result()
-            _reward_log.append({"step": _step[0], "code": codes[i], "score": scores[i]})
+    payloads = [{"code": code, "tests": test} for code, test in zip(codes, tests)]
+    scores = list(_run_sandbox_fn.map(payloads))
+    for i, score in enumerate(scores):
+        _reward_log.append({"step": _step[0], "code": codes[i], "score": score})
 
     best_i = max(range(len(scores)), key=lambda i: scores[i])
-    prompt_display = prompt_texts[best_i] if best_i < len(prompt_texts) else ""
-    console.print(Panel(
-        f"[bold]Prompt:[/bold]\n{prompt_display}\n\n"
-        f"[bold]All {len(codes)} completion(s):[/bold]\n" +
-        "\n\n".join(
-            f"[{'green' if s > 0 else 'red'}]── completion {j+1}  reward={s:.0%} ──[/{'green' if s > 0 else 'red'}]\n{c}"
-            for j, (c, s) in enumerate(zip(codes, scores))
-        ),
-        title=f"[bold yellow]GSPO step {_step[0]}[/bold yellow]",
-        border_style="yellow",
-    ))
     if scores[best_i] > 0:
         console.print(
-            f"  [bold green]↑ best reward={scores[best_i]:.0%}"
+            f"\n  [bold green]↑ step {_step[0]}  reward={scores[best_i]:.0%}"
             f"  ({int(scores[best_i]*4)}/4 tests)[/bold green]"
         )
+        console.print(Panel(
+            codes[best_i],
+            title=f"[bold green]Best completion — step {_step[0]}[/bold green]",
+            border_style="green",
+        ))
 
     return scores
 
@@ -433,21 +452,8 @@ def sft_warmup(model, tokenizer, tasks: list, steps: int = 30):
         ]
         texts.append(tokenizer.apply_chat_template(messages, tokenize=False))
 
-    last_task_idx = -1
     for step in range(1, steps + 1):
-        task_idx = (step - 1) % len(tasks)
-        text     = texts[task_idx]
-
-        if task_idx != last_task_idx:
-            task = tasks[task_idx]
-            console.print(Panel(
-                f"[bold]Prompt:[/bold]\n{task['prompt']}\n\n"
-                f"[bold]Target solution:[/bold]\n{task['solution']}",
-                title=f"[magenta]SFT task: {task['name']}[/magenta]",
-                border_style="magenta",
-            ))
-            last_task_idx = task_idx
-
+        text   = texts[(step - 1) % len(texts)]
         enc    = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
         labels = enc["input_ids"].clone()
 
@@ -513,10 +519,12 @@ def evaluate(model, tokenizer, tasks: list):
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
+@application()
+@function()
 def train_gspo():
     tasks       = TASKS[:3] if SMOKE else TASKS
     sft_steps   = 20        if SMOKE else 60
-    gspo_epochs = 1         if SMOKE else 20
+    gspo_epochs = 1         if SMOKE else 3
 
     console.print(Panel(
         "[bold green]RL GSPO — Code Generation with Hidden Test Suites[/bold green]\n\n"
@@ -524,7 +532,7 @@ def train_gspo():
         "Model       : SmolLM2-135M-Instruct  (135 M params, CPU-friendly)\n"
         "Task        : Implement Python functions from docstrings\n"
         "Reward      : fraction of hidden pytest tests passing (sandbox oracle)\n"
-        "Sandboxes   : G parallel TensorLake sandboxes per GSPO step\n"
+        "Sandboxes   : G parallel CodeSandboxEnv (OpenEnv) via TensorLake map-reduce per GSPO step\n"
         "Phase 1     : SFT warmup — correct solutions so model starts generating valid Python\n"
         "Phase 2     : GSPO — refines via reward signal from sandbox test results\n"
         "GPU needed  : No\n"
@@ -637,4 +645,5 @@ def train_gspo():
 
 
 if __name__ == "__main__":
-    train_gspo()
+    run_local_application(train_gspo)
+
