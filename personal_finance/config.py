@@ -90,6 +90,8 @@ def create_code_execution_image() -> Image:
             'for executable in /usr/local/lib/tensorlake-tools/node_modules/.bin/*; do [ ! '
             '-e "$executable" ] || ln -sf "$executable" /usr/local/bin/; done'
         )
+        .run("pnpm --dir /usr/local/lib/tensorlake-tools exec puppeteer browsers install chrome")
+        .env("NODE_PATH", "/usr/local/lib/tensorlake-tools/node_modules")
     )
 
 
